@@ -6,7 +6,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'rate-limiter/**'     # Only trigger if files in this folder change
+      - 'rate_limiter/**'     # Only trigger if files in this folder change
 
 jobs:
   build:
@@ -27,7 +27,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: ./rate-limiter
+          context: ./rate_limiter
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: quay.io/<namespace>/rate-limiter:latest
+          tags: quay.io/manishym/rate-limiter:latest
