@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rate-limiter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rate-limiter
+  template:
+    metadata:
+      labels:
+        app: rate-limiter
+    spec:
+      containers:
+      - name: rate-limiter
+        image: your-dockerhub-username/rate-limiter:latest
+        ports:
+        - containerPort: 8080

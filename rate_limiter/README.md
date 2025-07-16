@@ -7,14 +7,12 @@ A high-performance rate limiting system that controls API request rates using va
 - **Backend**: Go (Golang)
 - **Cache/Storage**: Redis for distributed rate limiting
 - **Algorithms**: Token Bucket, Sliding Window, Fixed Window
-- **Database**: PostgreSQL for configuration and analytics
 
 ## Key Features
 
 ### Core Functionality
 - [ ] Multiple rate limiting algorithms
 - [ ] Distributed rate limiting across multiple servers
-- [ ] Per-user and per-API endpoint rate limiting
 - [ ] Dynamic rate limit configuration
 - [ ] Rate limit monitoring and analytics
 - [ ] Burst capacity handling
@@ -421,4 +419,100 @@ go run loadtest/main.go -users=1000 -requests=10000 -duration=60s
 - Advanced analytics dashboard
 - Support for GraphQL rate limiting
 - Circuit breaker integration
-- Custom rate limiting middleware 
+- Custom rate limiting middleware
+
+## Testing
+
+This project includes comprehensive unit tests that cover all core functionality of the rate limiter. The tests use mocked Redis operations to ensure fast, reliable testing without external dependencies.
+
+### Test Coverage
+
+The test suite covers:
+- **Rate limiting logic**: Token bucket algorithm implementation
+- **HTTP handlers**: Both rate limit checking and health endpoints
+- **Edge cases**: Missing parameters, invalid data, Redis failures
+- **Multiple users**: Independent rate limiting per user
+- **Token refill**: Time-based token bucket refilling
+- **Error handling**: Graceful handling of Redis connection issues
+
+Current test coverage: **73.3%** of statements
+
+### Running Tests
+
+```bash
+# Run all tests
+go test
+
+# Run tests with verbose output
+go test -v
+
+# Run tests with coverage
+go test -cover
+
+# Generate HTML coverage report
+go test -coverprofile=coverage.out
+go tool cover -html=coverage.out -o coverage.html
+```
+
+### Test Cases
+
+#### Rate Limiting Tests
+- `TestRateLimitHandler_FirstRequest`: Tests first request for a new user (should be allowed)
+- `TestRateLimitHandler_SubsequentRequests`: Tests subsequent requests within bucket capacity
+- `TestRateLimitHandler_ExceedsLimit`: Tests behavior when rate limit is exceeded
+- `TestRateLimitHandler_TokenRefill`: Tests token bucket refill after time interval
+- `TestRateLimitHandler_CompleteFlow`: Integration test covering multiple requests until rate limit
+
+#### Edge Case Tests
+- `TestRateLimitHandler_MissingUserID`: Tests missing `user_id` parameter (should return 400)
+- `TestRateLimitHandler_EmptyUserID`: Tests empty `user_id` parameter (should return 400)
+- `TestRateLimitHandler_InvalidTokensInRedis`: Tests handling of invalid data in Redis
+- `TestRateLimitHandler_MultipleUsers`: Tests independent rate limiting for different users
+
+#### Health Check Tests
+- `TestHealthHandler_Success`: Tests successful health check with Redis connection
+- `TestHealthHandler_RedisFailure`: Tests health check when Redis is unavailable
+
+### Test Dependencies
+
+The tests use the following libraries:
+- `github.com/stretchr/testify`: Assertions and test utilities
+- `github.com/go-redis/redismock/v8`: Mock Redis client for testing
+- Standard `net/http/httptest`: HTTP testing utilities
+
+### Mocking Strategy
+
+Tests use `redismock` to mock Redis operations, allowing for:
+- **Predictable behavior**: Controlled Redis responses for different scenarios
+- **Fast execution**: No actual Redis connection required
+- **Isolation**: Tests don't interfere with each other
+- **Edge case testing**: Simulate Redis failures and error conditions
+
+### Adding New Tests
+
+When adding new functionality, ensure to:
+1. Create test cases for all code paths
+2. Test both success and failure scenarios
+3. Use appropriate Redis mocks with `redismock.ExpectGet()`, `redismock.ExpectSet()`, etc.
+4. Verify HTTP status codes, headers, and response bodies
+5. Check that all Redis expectations are met with `mock.ExpectationsWereMet()`
+
+Example test structure:
+```go
+func TestNewFeature(t *testing.T) {
+    // Setup mock Redis
+    db, mock := redismock.NewClientMock()
+    originalRdb := rdb
+    rdb = db
+    defer func() { rdb = originalRdb }()
+
+    // Mock Redis expectations
+    mock.ExpectGet("key").SetVal("value")
+    
+    // Test your feature
+    // ... test code ...
+    
+    // Verify all expectations were met
+    require.NoError(t, mock.ExpectationsWereMet())
+}
+``` 

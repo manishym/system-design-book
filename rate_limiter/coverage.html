@@ -1,0 +1,239 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>rate-limiter: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">rate-limiter/main.go (73.3%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package main
+
+import (
+        "context"
+        "flag"
+        "fmt"
+        "log"
+        "net/http"
+        "strconv"
+        "time"
+
+        "github.com/go-redis/redis/v8"
+)
+
+var ctx = context.Background()
+
+var (
+        // Configuration variables
+        redisAddr      string
+        redisPassword  string
+        redisDB        int
+        bucketCapacity int
+        refillInterval time.Duration
+        serverPort     string
+)
+
+var rdb *redis.Client
+
+func init() <span class="cov8" title="1">{
+        // Define command line flags with default values
+        flag.StringVar(&amp;redisAddr, "redis-addr", "redis-master:6379", "Redis server address")
+        flag.StringVar(&amp;redisPassword, "redis-password", "", "Redis password")
+        flag.IntVar(&amp;redisDB, "redis-db", 0, "Redis database number")
+        flag.IntVar(&amp;bucketCapacity, "bucket-capacity", 5, "Token bucket capacity")
+        flag.DurationVar(&amp;refillInterval, "refill-interval", 10*time.Second, "Token refill interval")
+        flag.StringVar(&amp;serverPort, "port", "8080", "Server port")
+}</span>
+
+func main() <span class="cov0" title="0">{
+        // Parse command line flags
+        flag.Parse()
+
+        // Log configuration
+        log.Printf("Starting rate limiter with config:")
+        log.Printf("  Redis Address: %s", redisAddr)
+        log.Printf("  Redis DB: %d", redisDB)
+        log.Printf("  Bucket Capacity: %d", bucketCapacity)
+        log.Printf("  Refill Interval: %v", refillInterval)
+        log.Printf("  Server Port: %s", serverPort)
+
+        // Initialize Redis client
+        rdb = redis.NewClient(&amp;redis.Options{
+                Addr:     redisAddr,
+                Password: redisPassword,
+                DB:       redisDB,
+        })
+
+        // Test Redis connection
+        _, err := rdb.Ping(ctx).Result()
+        if err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("Failed to connect to Redis: %v", err)
+        }</span>
+        <span class="cov0" title="0">log.Println("Successfully connected to Redis")
+
+        // Setup HTTP handlers
+        http.HandleFunc("/check", rateLimitHandler)
+        http.HandleFunc("/health", healthHandler)
+
+        log.Printf("Rate limiter running on port %s", serverPort)
+        log.Fatal(http.ListenAndServe(":"+serverPort, nil))</span>
+}
+
+func rateLimitHandler(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
+        userID := r.URL.Query().Get("user_id")
+        if userID == "" </span><span class="cov8" title="1">{
+                http.Error(w, "user_id required", http.StatusBadRequest)
+                return
+        }</span>
+
+        <span class="cov8" title="1">keyTokens := fmt.Sprintf("ratelimit:%s:tokens", userID)
+        keyTimestamp := fmt.Sprintf("ratelimit:%s:ts", userID)
+
+        now := time.Now().Unix()
+
+        // Get current state
+        tokensStr, _ := rdb.Get(ctx, keyTokens).Result()
+        tsStr, _ := rdb.Get(ctx, keyTimestamp).Result()
+
+        var tokens int
+        var lastRefill int64
+
+        tokens, _ = strconv.Atoi(tokensStr)
+        lastRefill, _ = strconv.ParseInt(tsStr, 10, 64)
+
+        // refill tokens
+        if tokensStr == "" || now-lastRefill &gt;= int64(refillInterval.Seconds()) </span><span class="cov8" title="1">{
+                tokens = bucketCapacity
+                lastRefill = now
+        }</span>
+
+        <span class="cov8" title="1">if tokens &gt; 0 </span><span class="cov8" title="1">{
+                tokens -= 1
+                rdb.Set(ctx, keyTokens, tokens, refillInterval)
+                rdb.Set(ctx, keyTimestamp, lastRefill, refillInterval)
+
+                // Set response headers
+                w.Header().Set("X-RateLimit-Limit", strconv.Itoa(bucketCapacity))
+                w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(tokens))
+                w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(lastRefill+int64(refillInterval.Seconds()), 10))
+
+                w.WriteHeader(http.StatusOK)
+                w.Write([]byte("allowed"))
+        }</span> else<span class="cov8" title="1"> {
+                // Set response headers for rate limit exceeded
+                w.Header().Set("X-RateLimit-Limit", strconv.Itoa(bucketCapacity))
+                w.Header().Set("X-RateLimit-Remaining", "0")
+                w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(lastRefill+int64(refillInterval.Seconds()), 10))
+                w.Header().Set("Retry-After", strconv.Itoa(int(refillInterval.Seconds())))
+
+                w.WriteHeader(http.StatusTooManyRequests)
+                w.Write([]byte("rate limit exceeded"))
+        }</span>
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
+        // Check Redis connection
+        _, err := rdb.Ping(ctx).Result()
+        if err != nil </span><span class="cov8" title="1">{
+                w.WriteHeader(http.StatusServiceUnavailable)
+                w.Write([]byte("Redis connection failed"))
+                return
+        }</span>
+
+        <span class="cov8" title="1">w.WriteHeader(http.StatusOK)
+        w.Write([]byte("OK"))</span>
+}
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>
