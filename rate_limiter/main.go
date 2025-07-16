@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -21,20 +22,22 @@ var (
 	redisPassword  string
 	redisDB        int
 	bucketCapacity int
-	refillRate     float64 // tokens per second instead of interval
+	rate           float64 // tokens per second for token bucket, leak rate for leaky bucket
+	algorithm      string  // "token" or "leaky"
 	serverPort     string
 )
 
 var rdb *redis.Client
-var tokenBucketScript *redis.Script
+var rateLimitScript *redis.Script
 
 func init() {
 	// Define command line flags with default values
 	flag.StringVar(&redisAddr, "redis-addr", "redis-master:6379", "Redis server address")
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
 	flag.IntVar(&redisDB, "redis-db", 0, "Redis database number")
-	flag.IntVar(&bucketCapacity, "bucket-capacity", 5, "Token bucket capacity")
-	flag.Float64Var(&refillRate, "refill-rate", 0.1, "Token refill rate (tokens per second)")
+	flag.IntVar(&bucketCapacity, "bucket-capacity", 5, "Bucket capacity (max tokens for token bucket, max requests for leaky bucket)")
+	flag.Float64Var(&rate, "rate", 1, "Rate (tokens per second for token bucket, leak rate for leaky bucket)")
+	flag.StringVar(&algorithm, "algorithm", "leaky", "Rate limiting algorithm: 'token' or 'leaky'")
 	flag.StringVar(&serverPort, "port", "8080", "Server port")
 }
 
@@ -42,12 +45,23 @@ func main() {
 	// Parse command line flags
 	flag.Parse()
 
+	// Validate algorithm
+	algorithm = strings.ToLower(algorithm)
+	if algorithm != "token" && algorithm != "leaky" {
+		log.Fatalf("Invalid algorithm '%s'. Must be 'token' or 'leaky'", algorithm)
+	}
+
 	// Log configuration
 	log.Printf("Starting rate limiter with config:")
+	log.Printf("  Algorithm: %s bucket", algorithm)
 	log.Printf("  Redis Address: %s", redisAddr)
 	log.Printf("  Redis DB: %d", redisDB)
 	log.Printf("  Bucket Capacity: %d", bucketCapacity)
-	log.Printf("  Refill Rate: %.2f tokens/second", refillRate)
+	if algorithm == "token" {
+		log.Printf("  Refill Rate: %.2f tokens/second", rate)
+	} else {
+		log.Printf("  Leak Rate: %.2f requests/second", rate)
+	}
 	log.Printf("  Server Port: %s", serverPort)
 
 	// Initialize Redis client
@@ -64,12 +78,12 @@ func main() {
 	}
 	log.Println("Successfully connected to Redis")
 
-	// Load the token bucket Lua script
-	err = loadTokenBucketScript()
+	// Load the appropriate Lua script
+	err = loadRateLimitScript()
 	if err != nil {
-		log.Fatalf("Failed to load token bucket script: %v", err)
+		log.Fatalf("Failed to load rate limiting script: %v", err)
 	}
-	log.Println("Successfully loaded token bucket Lua script")
+	log.Printf("Successfully loaded %s bucket Lua script", algorithm)
 
 	// Setup HTTP handlers
 	http.HandleFunc("/check", rateLimitHandler)
@@ -79,15 +93,22 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+serverPort, nil))
 }
 
-func loadTokenBucketScript() error {
+func loadRateLimitScript() error {
+	var scriptFile string
+	if algorithm == "token" {
+		scriptFile = "token_bucket.lua"
+	} else {
+		scriptFile = "leaky_bucket.lua"
+	}
+
 	// Read the Lua script from file
-	scriptContent, err := ioutil.ReadFile("token_bucket.lua")
+	scriptContent, err := ioutil.ReadFile(scriptFile)
 	if err != nil {
-		return fmt.Errorf("failed to read token_bucket.lua: %w", err)
+		return fmt.Errorf("failed to read %s: %w", scriptFile, err)
 	}
 
 	// Create Redis script object
-	tokenBucketScript = redis.NewScript(string(scriptContent))
+	rateLimitScript = redis.NewScript(string(scriptContent))
 	return nil
 }
 
@@ -99,64 +120,82 @@ func rateLimitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Redis key for this user's bucket
-	key := fmt.Sprintf("ratelimit:%s", userID)
+	key := fmt.Sprintf("ratelimit:%s:%s", algorithm, userID)
 
 	// Current timestamp in seconds
 	now := time.Now().Unix()
 
-	// Execute the token bucket Lua script
+	// Execute the rate limiting Lua script
+	// Both scripts use the same parameters:
 	// KEYS[1]: Redis key
-	// ARGV[1]: max tokens (bucket capacity)
-	// ARGV[2]: refill rate (tokens per second)
-	// ARGV[3]: tokens requested (usually 1)
+	// ARGV[1]: bucket capacity
+	// ARGV[2]: rate (refill rate for token bucket, leak rate for leaky bucket)
+	// ARGV[3]: requests (usually 1)
 	// ARGV[4]: current timestamp (in seconds)
-	result, err := tokenBucketScript.Run(ctx, rdb, []string{key},
-		bucketCapacity, refillRate, 1, now).Result()
+	result, err := rateLimitScript.Run(ctx, rdb, []string{key},
+		bucketCapacity, rate, 1, now).Result()
 
 	if err != nil {
-		log.Printf("Error executing token bucket script: %v", err)
+		log.Printf("Error executing %s bucket script: %v", algorithm, err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// The script returns a boolean (0 or 1)
+	// The script returns 1 for allowed, 0 for denied
 	allowed := result.(int64) == 1
 
 	if allowed {
 		// Get current bucket state for response headers
-		bucketData, err := rdb.HMGet(ctx, key, "tokens", "last").Result()
+		var stateFields []string
+		if algorithm == "token" {
+			stateFields = []string{"tokens", "last"}
+		} else {
+			stateFields = []string{"volume", "last_leak"}
+		}
+
+		bucketData, err := rdb.HMGet(ctx, key, stateFields...).Result()
 		if err != nil {
 			log.Printf("Error getting bucket state: %v", err)
 			// Continue with default values
 		}
 
-		// Parse current tokens for response header
-		var remainingTokens int
+		// Parse current state for response header
+		var remaining int
 		if len(bucketData) > 0 && bucketData[0] != nil {
-			if tokens, err := strconv.ParseFloat(bucketData[0].(string), 64); err == nil {
-				remainingTokens = int(tokens)
+			if algorithm == "token" {
+				// For token bucket, remaining = tokens left
+				if tokens, err := strconv.ParseFloat(bucketData[0].(string), 64); err == nil {
+					remaining = int(tokens)
+				}
+			} else {
+				// For leaky bucket, remaining = capacity - current volume
+				if volume, err := strconv.ParseFloat(bucketData[0].(string), 64); err == nil {
+					remaining = bucketCapacity - int(volume)
+				}
 			}
 		}
 
-		// Calculate next refill time (approximate)
-		nextRefillSeconds := int64(1.0 / refillRate)
-		nextRefill := now + nextRefillSeconds
+		// Calculate next available time (approximate)
+		nextAvailableSeconds := int64(1.0 / rate)
+		nextAvailable := now + nextAvailableSeconds
 
 		// Set response headers for successful request
 		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(bucketCapacity))
-		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remainingTokens))
-		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(nextRefill, 10))
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(nextAvailable, 10))
+		w.Header().Set("X-RateLimit-Algorithm", algorithm+" bucket")
 
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("allowed"))
 	} else {
 		// Calculate retry after time
-		retryAfterSeconds := int(1.0 / refillRate)
+		retryAfterSeconds := int(1.0 / rate)
 
 		// Set response headers for rate limit exceeded
 		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(bucketCapacity))
 		w.Header().Set("X-RateLimit-Remaining", "0")
 		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(now+int64(retryAfterSeconds), 10))
+		w.Header().Set("X-RateLimit-Algorithm", algorithm+" bucket")
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 
 		w.WriteHeader(http.StatusTooManyRequests)

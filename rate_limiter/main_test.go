@@ -9,6 +9,52 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func setupTestEnvironment(t *testing.T, algo string) func() {
+	// Save original values
+	originalRdb := rdb
+	originalScript := rateLimitScript
+	originalCapacity := bucketCapacity
+	originalRate := rate
+	originalAlgorithm := algorithm
+
+	// Set test configuration
+	bucketCapacity = 5
+	rate = 0.1 // 1 token every 10 seconds for token bucket, leak 0.1 requests/sec for leaky bucket
+	algorithm = algo
+
+	// Try to connect to Redis
+	testClient := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+		DB:   1, // Use different DB for testing
+	})
+
+	// Test if Redis is available
+	_, err := testClient.Ping(ctx).Result()
+	if err != nil {
+		t.Skip("Redis not available, skipping test")
+		return func() {}
+	}
+
+	rdb = testClient
+
+	// Load the appropriate script
+	err = loadRateLimitScript()
+	if err != nil {
+		t.Fatalf("Failed to load %s bucket script: %v", algorithm, err)
+	}
+
+	cleanup := func() {
+		testClient.Close()
+		rdb = originalRdb
+		rateLimitScript = originalScript
+		bucketCapacity = originalCapacity
+		rate = originalRate
+		algorithm = originalAlgorithm
+	}
+
+	return cleanup
+}
+
 func TestRateLimitHandler_MissingUserID(t *testing.T) {
 	// Create request without user_id parameter
 	req := httptest.NewRequest("GET", "/check", nil)
@@ -78,52 +124,19 @@ func TestHealthHandler_RedisFailure(t *testing.T) {
 	assert.Equal(t, "Redis connection failed", w.Body.String())
 }
 
-// TestRateLimitIntegration tests the complete rate limiting functionality
-// This requires Redis to be running on localhost:6379
-func TestRateLimitIntegration(t *testing.T) {
-	// Save original values
-	originalRdb := rdb
-	originalScript := tokenBucketScript
-	originalCapacity := bucketCapacity
-	originalRate := refillRate
-
-	defer func() {
-		rdb = originalRdb
-		tokenBucketScript = originalScript
-		bucketCapacity = originalCapacity
-		refillRate = originalRate
-	}()
+// TestTokenBucketIntegration tests the complete token bucket functionality
+func TestTokenBucketIntegration(t *testing.T) {
+	cleanup := setupTestEnvironment(t, "token")
+	defer cleanup()
 
 	// Set up test configuration
 	bucketCapacity = 2
-	refillRate = 1.0 // 1 token per second
+	rate = 1.0 // 1 token per second
 
-	// Try to connect to Redis
-	testClient := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-		DB:   1, // Use different DB for testing
-	})
-
-	// Test if Redis is available
-	_, err := testClient.Ping(ctx).Result()
-	if err != nil {
-		t.Skip("Redis not available, skipping integration test")
-		return
-	}
-
-	rdb = testClient
-	defer testClient.Close()
-
-	// Load the Lua script
-	err = loadTokenBucketScript()
-	if err != nil {
-		t.Fatalf("Failed to load token bucket script: %v", err)
-	}
-
-	userID := "test_user_123"
+	userID := "test_token_user"
 
 	// Clean up any existing state
-	key := "ratelimit:" + userID
+	key := "ratelimit:token:" + userID
 	rdb.Del(ctx, key)
 
 	// Test 1: First request should be allowed
@@ -134,6 +147,7 @@ func TestRateLimitIntegration(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w1.Code)
 	assert.Equal(t, "allowed", w1.Body.String())
 	assert.Equal(t, "2", w1.Header().Get("X-RateLimit-Limit"))
+	assert.Equal(t, "token bucket", w1.Header().Get("X-RateLimit-Algorithm"))
 
 	// Test 2: Second request should be allowed
 	req2 := httptest.NewRequest("GET", "/check?user_id="+userID, nil)
@@ -142,9 +156,8 @@ func TestRateLimitIntegration(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w2.Code)
 	assert.Equal(t, "allowed", w2.Body.String())
-	assert.Equal(t, "2", w2.Header().Get("X-RateLimit-Limit"))
 
-	// Test 3: Third request should be rate limited
+	// Test 3: Third request should be rate limited (bucket exhausted)
 	req3 := httptest.NewRequest("GET", "/check?user_id="+userID, nil)
 	w3 := httptest.NewRecorder()
 	rateLimitHandler(w3, req3)
@@ -154,9 +167,95 @@ func TestRateLimitIntegration(t *testing.T) {
 	assert.Equal(t, "2", w3.Header().Get("X-RateLimit-Limit"))
 	assert.Equal(t, "0", w3.Header().Get("X-RateLimit-Remaining"))
 	assert.Equal(t, "1", w3.Header().Get("Retry-After"))
+	assert.Equal(t, "token bucket", w3.Header().Get("X-RateLimit-Algorithm"))
 
 	// Clean up
 	rdb.Del(ctx, key)
 
-	t.Logf("Integration test completed successfully")
+	t.Logf("Token bucket integration test completed successfully")
+}
+
+// TestLeakyBucketIntegration tests the complete leaky bucket functionality
+func TestLeakyBucketIntegration(t *testing.T) {
+	cleanup := setupTestEnvironment(t, "leaky")
+	defer cleanup()
+
+	// Set up test configuration
+	bucketCapacity = 2
+	rate = 1.0 // leak 1 request per second
+
+	userID := "test_leaky_user"
+
+	// Clean up any existing state
+	key := "ratelimit:leaky:" + userID
+	rdb.Del(ctx, key)
+
+	// Test 1: First request should be allowed
+	req1 := httptest.NewRequest("GET", "/check?user_id="+userID, nil)
+	w1 := httptest.NewRecorder()
+	rateLimitHandler(w1, req1)
+
+	assert.Equal(t, http.StatusOK, w1.Code)
+	assert.Equal(t, "allowed", w1.Body.String())
+	assert.Equal(t, "2", w1.Header().Get("X-RateLimit-Limit"))
+	assert.Equal(t, "leaky bucket", w1.Header().Get("X-RateLimit-Algorithm"))
+
+	// Test 2: Second request should be allowed
+	req2 := httptest.NewRequest("GET", "/check?user_id="+userID, nil)
+	w2 := httptest.NewRecorder()
+	rateLimitHandler(w2, req2)
+
+	assert.Equal(t, http.StatusOK, w2.Code)
+	assert.Equal(t, "allowed", w2.Body.String())
+
+	// Test 3: Third request should be rate limited (bucket full)
+	req3 := httptest.NewRequest("GET", "/check?user_id="+userID, nil)
+	w3 := httptest.NewRecorder()
+	rateLimitHandler(w3, req3)
+
+	assert.Equal(t, http.StatusTooManyRequests, w3.Code)
+	assert.Equal(t, "rate limit exceeded", w3.Body.String())
+	assert.Equal(t, "2", w3.Header().Get("X-RateLimit-Limit"))
+	assert.Equal(t, "0", w3.Header().Get("X-RateLimit-Remaining"))
+	assert.Equal(t, "1", w3.Header().Get("Retry-After"))
+	assert.Equal(t, "leaky bucket", w3.Header().Get("X-RateLimit-Algorithm"))
+
+	// Clean up
+	rdb.Del(ctx, key)
+
+	t.Logf("Leaky bucket integration test completed successfully")
+}
+
+// TestAlgorithmIsolation ensures token and leaky buckets are isolated from each other
+func TestAlgorithmIsolation(t *testing.T) {
+	// Test token bucket first
+	cleanup1 := setupTestEnvironment(t, "token")
+	defer cleanup1()
+
+	userID := "isolation_test_user"
+	bucketCapacity = 1
+	rate = 1.0
+
+	// Use up token bucket
+	req1 := httptest.NewRequest("GET", "/check?user_id="+userID, nil)
+	w1 := httptest.NewRecorder()
+	rateLimitHandler(w1, req1)
+	assert.Equal(t, http.StatusOK, w1.Code)
+
+	req2 := httptest.NewRequest("GET", "/check?user_id="+userID, nil)
+	w2 := httptest.NewRecorder()
+	rateLimitHandler(w2, req2)
+	assert.Equal(t, http.StatusTooManyRequests, w2.Code) // Token bucket exhausted
+
+	// Switch to leaky bucket
+	cleanup2 := setupTestEnvironment(t, "leaky")
+	defer cleanup2()
+
+	// Leaky bucket should start fresh (different Redis key)
+	req3 := httptest.NewRequest("GET", "/check?user_id="+userID, nil)
+	w3 := httptest.NewRecorder()
+	rateLimitHandler(w3, req3)
+	assert.Equal(t, http.StatusOK, w3.Code) // Leaky bucket allows request
+
+	t.Logf("Algorithm isolation test completed successfully")
 }
