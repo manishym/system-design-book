@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY go.mod ./
 COPY main.go ./
+COPY token_bucket.lua ./
 
 RUN go mod tidy
 RUN go build -o rate-limiter
