@@ -1,0 +1,266 @@
+name: Unit and Integration Tests
+
+on:
+  pull_request:
+    paths:
+      - 'rate_limiter/**'     # Only trigger if files in rate_limiter folder change
+      - '.github/workflows/unit-tests.yaml'  # Also trigger if this workflow changes
+  push:
+    branches: [ main ]
+    paths:
+      - 'rate_limiter/**'
+      - '.github/workflows/unit-tests.yaml'
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./rate_limiter
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.21
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Start Redis for unit tests
+      run: |
+        docker run -d --name redis-unit-test -p 6379:6379 redis:alpine
+        # Wait for Redis to be ready
+        sleep 5
+
+    - name: Run unit tests
+      run: |
+        go mod download
+        go test -v -race -coverprofile=coverage.out .
+        go tool cover -html=coverage.out -o coverage.html
+
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: rate_limiter/coverage.html
+
+    - name: Check test coverage
+      run: |
+        COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+        echo "Total coverage: ${COVERAGE}%"
+        # Require at least 70% coverage (using awk for comparison to avoid bc dependency)
+        if awk "BEGIN {exit !($COVERAGE < 70)}"; then
+          echo "Coverage $COVERAGE% is below required 70%"
+          exit 1
+        fi
+
+    - name: Cleanup Redis
+      if: always()
+      run: docker stop redis-unit-test && docker rm redis-unit-test
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    defaults:
+      run:
+        working-directory: ./rate_limiter
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.21
+
+    - name: Install KinD
+      uses: helm/kind-action@v1.8.0
+      with:
+        cluster_name: kind
+        node_image: kindest/node:v1.27.3
+        wait: 300s
+
+    - name: Verify cluster is ready
+      run: |
+        echo "Waiting for cluster to be ready..."
+        kubectl cluster-info --context kind-kind
+        kubectl get nodes
+        kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+    - name: Build and load Docker image
+      run: |
+        docker build -t rate-limiter:test .
+        kind load docker-image rate-limiter:test --name kind
+
+    - name: Deploy Redis
+      run: |
+        echo "Installing Helm and adding Bitnami repo..."
+        helm repo add bitnami https://charts.bitnami.com/bitnami
+        helm repo update
+        
+        echo "Installing Redis..."
+        helm install redis bitnami/redis \
+          --set auth.enabled=false \
+          --set replica.replicaCount=1 \
+          --set architecture=standalone \
+          --wait --timeout=300s
+        
+        echo "Verifying Redis is ready..."
+        kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=redis --timeout=300s
+
+    - name: Deploy Rate Limiter
+      run: |
+        echo "Deploying Rate Limiter..."
+        kubectl apply -f k8s/deployment-ci.yaml
+        kubectl apply -f k8s/service.yaml
+        
+        echo "Waiting for deployment to be ready..."
+        kubectl rollout status deployment/rate-limiter --timeout=300s
+        kubectl wait --for=condition=Ready pod -l app=rate-limiter --timeout=300s
+
+    - name: Verify all services are ready
+      run: |
+        echo "Checking all pods are running..."
+        kubectl get pods -o wide
+        kubectl get services
+        echo "Waiting additional time for services to stabilize..."
+        sleep 15
+
+    - name: Run Integration Tests
+      run: |
+        echo "Starting port forward to rate-limiter service..."
+        kubectl port-forward svc/rate-limiter 8080:80 &
+        PORT_FORWARD_PID=$!
+        
+        echo "Waiting for port forward to establish..."
+        sleep 10
+        
+        # Verify port forward is working
+        if ! netstat -tuln | grep :8080; then
+          echo "Port forward failed to establish"
+          kubectl get pods
+          kubectl logs -l app=rate-limiter --tail=50
+          exit 1
+        fi
+        
+        echo "Testing health endpoint..."
+        if ! curl -f http://localhost:8080/health; then
+          echo "Health check failed"
+          kubectl logs -l app=rate-limiter --tail=50
+          exit 1
+        fi
+        
+        echo "Testing user auto-creation and rate limiting..."
+        for i in {1..3}; do
+          echo "Request $i:"
+          if ! curl -i http://localhost:8080/check?user_id=test_user_$i; then
+            echo "Rate limiting test failed"
+            kubectl logs -l app=rate-limiter --tail=50
+            exit 1
+          fi
+          echo ""
+        done
+        
+        echo "Testing user management API..."
+        if ! curl -X POST "http://localhost:8080/users?user_id=integration_test&max_tokens=5&refill_rate=1"; then
+          echo "User creation failed"
+          kubectl logs -l app=rate-limiter --tail=50
+          exit 1
+        fi
+        
+        if ! curl -i "http://localhost:8080/users?user_id=integration_test"; then
+          echo "User retrieval failed"
+          kubectl logs -l app=rate-limiter --tail=50
+          exit 1
+        fi
+        
+        echo "All integration tests passed!"
+        
+        # Clean up port forward
+        kill $PORT_FORWARD_PID || true
+
+    - name: Debug info on failure
+      if: failure()
+      run: |
+        echo "=== Debugging information ==="
+        echo "Cluster info:"
+        kubectl cluster-info
+        echo ""
+        echo "All pods:"
+        kubectl get pods -o wide
+        echo ""
+        echo "All services:"
+        kubectl get services
+        echo ""
+        echo "Rate limiter logs:"
+        kubectl logs -l app=rate-limiter --tail=100 || echo "No rate-limiter logs found"
+        echo ""
+        echo "Redis logs:"
+        kubectl logs -l app.kubernetes.io/name=redis --tail=50 || echo "No redis logs found"
+        echo ""
+        echo "Events:"
+        kubectl get events --sort-by=.metadata.creationTimestamp
+
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "Cleaning up resources..."
+        kubectl delete deployment rate-limiter --ignore-not-found=true
+        kubectl delete service rate-limiter --ignore-not-found=true
+        helm uninstall redis --ignore-not-found=true || echo "Redis cleanup completed"
+        echo "Cleanup completed"
+
+  advanced-integration-tests:
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    defaults:
+      run:
+        working-directory: ./rate_limiter
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.21
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Run advanced integration tests
+      run: |
+        # Run integration tests with quick mode for CI
+        ./test/integration/run-integration-tests.sh --quick
+
+    - name: Run chaos testing (quick mode)
+      run: |
+        # Run chaos testing for 60 seconds in CI
+        ./test/chaos/chaos-test.sh --quick
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: advanced-integration-test-results
+        path: |
+          rate_limiter/*.log
+          rate_limiter/test/integration/rate-limiter-integration
+          rate_limiter/coverage.html
+        retention-days: 7
