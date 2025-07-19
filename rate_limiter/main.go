@@ -35,8 +35,8 @@ func init() {
 	flag.StringVar(&redisAddr, "redis-addr", "redis-master:6379", "Redis server address")
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
 	flag.IntVar(&redisDB, "redis-db", 0, "Redis database number")
-	flag.IntVar(&bucketCapacity, "bucket-capacity", 5, "Bucket capacity (max tokens for token bucket, max requests for leaky bucket)")
-	flag.Float64Var(&rate, "rate", 1, "Rate (tokens per second for token bucket, leak rate for leaky bucket)")
+	flag.IntVar(&bucketCapacity, "bucket-capacity", 5000, "Bucket capacity (max tokens for token bucket, max requests for leaky bucket)")
+	flag.Float64Var(&rate, "rate", 1000, "Rate (tokens per second for token bucket, leak rate for leaky bucket)")
 	flag.StringVar(&algorithm, "algorithm", "leaky", "Rate limiting algorithm: 'token' or 'leaky'")
 	flag.StringVar(&serverPort, "port", "8080", "Server port")
 }

@@ -9,4 +9,4 @@ RUN go build -o rate-limiter
 
 EXPOSE 8080
 
-CMD ["./rate-limiter "]
+CMD ["./rate-limiter"]
