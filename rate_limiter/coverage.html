@@ -75,9 +75,11 @@ import (
         "context"
         "flag"
         "fmt"
+        "io/ioutil"
         "log"
         "net/http"
         "strconv"
+        "strings"
         "time"
 
         "github.com/go-redis/redis/v8"
@@ -91,19 +93,22 @@ var (
         redisPassword  string
         redisDB        int
         bucketCapacity int
-        refillInterval time.Duration
+        rate           float64 // tokens per second for token bucket, leak rate for leaky bucket
+        algorithm      string  // "token" or "leaky"
         serverPort     string
 )
 
 var rdb *redis.Client
+var rateLimitScript *redis.Script
 
 func init() <span class="cov8" title="1">{
         // Define command line flags with default values
         flag.StringVar(&amp;redisAddr, "redis-addr", "redis-master:6379", "Redis server address")
         flag.StringVar(&amp;redisPassword, "redis-password", "", "Redis password")
         flag.IntVar(&amp;redisDB, "redis-db", 0, "Redis database number")
-        flag.IntVar(&amp;bucketCapacity, "bucket-capacity", 5, "Token bucket capacity")
-        flag.DurationVar(&amp;refillInterval, "refill-interval", 10*time.Second, "Token refill interval")
+        flag.IntVar(&amp;bucketCapacity, "bucket-capacity", 5, "Bucket capacity (max tokens for token bucket, max requests for leaky bucket)")
+        flag.Float64Var(&amp;rate, "rate", 1, "Rate (tokens per second for token bucket, leak rate for leaky bucket)")
+        flag.StringVar(&amp;algorithm, "algorithm", "leaky", "Rate limiting algorithm: 'token' or 'leaky'")
         flag.StringVar(&amp;serverPort, "port", "8080", "Server port")
 }</span>
 
@@ -111,13 +116,24 @@ func main() <span class="cov0" title="0">{
         // Parse command line flags
         flag.Parse()
 
+        // Validate algorithm
+        algorithm = strings.ToLower(algorithm)
+        if algorithm != "token" &amp;&amp; algorithm != "leaky" </span><span class="cov0" title="0">{
+                log.Fatalf("Invalid algorithm '%s'. Must be 'token' or 'leaky'", algorithm)
+        }</span>
+
         // Log configuration
-        log.Printf("Starting rate limiter with config:")
+        <span class="cov0" title="0">log.Printf("Starting rate limiter with config:")
+        log.Printf("  Algorithm: %s bucket", algorithm)
         log.Printf("  Redis Address: %s", redisAddr)
         log.Printf("  Redis DB: %d", redisDB)
         log.Printf("  Bucket Capacity: %d", bucketCapacity)
-        log.Printf("  Refill Interval: %v", refillInterval)
-        log.Printf("  Server Port: %s", serverPort)
+        if algorithm == "token" </span><span class="cov0" title="0">{
+                log.Printf("  Refill Rate: %.2f tokens/second", rate)
+        }</span> else<span class="cov0" title="0"> {
+                log.Printf("  Leak Rate: %.2f requests/second", rate)
+        }</span>
+        <span class="cov0" title="0">log.Printf("  Server Port: %s", serverPort)
 
         // Initialize Redis client
         rdb = redis.NewClient(&amp;redis.Options{
@@ -133,12 +149,39 @@ func main() <span class="cov0" title="0">{
         }</span>
         <span class="cov0" title="0">log.Println("Successfully connected to Redis")
 
+        // Load the appropriate Lua script
+        err = loadRateLimitScript()
+        if err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("Failed to load rate limiting script: %v", err)
+        }</span>
+        <span class="cov0" title="0">log.Printf("Successfully loaded %s bucket Lua script", algorithm)
+
         // Setup HTTP handlers
         http.HandleFunc("/check", rateLimitHandler)
         http.HandleFunc("/health", healthHandler)
+        http.HandleFunc("/users", userManagementHandler)
 
         log.Printf("Rate limiter running on port %s", serverPort)
         log.Fatal(http.ListenAndServe(":"+serverPort, nil))</span>
+}
+
+func loadRateLimitScript() error <span class="cov8" title="1">{
+        var scriptFile string
+        if algorithm == "token" </span><span class="cov8" title="1">{
+                scriptFile = "token_bucket.lua"
+        }</span> else<span class="cov8" title="1"> {
+                scriptFile = "leaky_bucket.lua"
+        }</span>
+
+        // Read the Lua script from file
+        <span class="cov8" title="1">scriptContent, err := ioutil.ReadFile(scriptFile)
+        if err != nil </span><span class="cov0" title="0">{
+                return fmt.Errorf("failed to read %s: %w", scriptFile, err)
+        }</span>
+
+        // Create Redis script object
+        <span class="cov8" title="1">rateLimitScript = redis.NewScript(string(scriptContent))
+        return nil</span>
 }
 
 func rateLimitHandler(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
@@ -148,45 +191,85 @@ func rateLimitHandler(w http.ResponseWriter, r *http.Request) <span class="cov8"
                 return
         }</span>
 
-        <span class="cov8" title="1">keyTokens := fmt.Sprintf("ratelimit:%s:tokens", userID)
-        keyTimestamp := fmt.Sprintf("ratelimit:%s:ts", userID)
+        // Redis key for this user's bucket
+        <span class="cov8" title="1">key := fmt.Sprintf("ratelimit:%s:%s", algorithm, userID)
 
+        // Current timestamp in seconds
         now := time.Now().Unix()
 
-        // Get current state
-        tokensStr, _ := rdb.Get(ctx, keyTokens).Result()
-        tsStr, _ := rdb.Get(ctx, keyTimestamp).Result()
+        // Execute the rate limiting Lua script
+        // Both scripts use the same parameters:
+        // KEYS[1]: Redis key
+        // ARGV[1]: default bucket capacity (used for new users)
+        // ARGV[2]: default rate (refill rate for token bucket, leak rate for leaky bucket, used for new users)
+        // ARGV[3]: requests (usually 1)
+        // ARGV[4]: current timestamp (in seconds)
+        // ARGV[5]: user ID
+        result, err := rateLimitScript.Run(ctx, rdb, []string{key},
+                bucketCapacity, rate, 1, now, userID).Result()
 
-        var tokens int
-        var lastRefill int64
-
-        tokens, _ = strconv.Atoi(tokensStr)
-        lastRefill, _ = strconv.ParseInt(tsStr, 10, 64)
-
-        // refill tokens
-        if tokensStr == "" || now-lastRefill &gt;= int64(refillInterval.Seconds()) </span><span class="cov8" title="1">{
-                tokens = bucketCapacity
-                lastRefill = now
+        if err != nil </span><span class="cov0" title="0">{
+                log.Printf("Error executing %s bucket script: %v", algorithm, err)
+                http.Error(w, "internal server error", http.StatusInternalServerError)
+                return
         }</span>
 
-        <span class="cov8" title="1">if tokens &gt; 0 </span><span class="cov8" title="1">{
-                tokens -= 1
-                rdb.Set(ctx, keyTokens, tokens, refillInterval)
-                rdb.Set(ctx, keyTimestamp, lastRefill, refillInterval)
+        // The script returns 1 for allowed, 0 for denied
+        <span class="cov8" title="1">allowed := result.(int64) == 1
 
-                // Set response headers
+        if allowed </span><span class="cov8" title="1">{
+                // Get current bucket state for response headers
+                var stateFields []string
+                if algorithm == "token" </span><span class="cov8" title="1">{
+                        stateFields = []string{"tokens", "last"}
+                }</span> else<span class="cov8" title="1"> {
+                        stateFields = []string{"volume", "last_leak"}
+                }</span>
+
+                <span class="cov8" title="1">bucketData, err := rdb.HMGet(ctx, key, stateFields...).Result()
+                if err != nil </span><span class="cov0" title="0">{
+                        log.Printf("Error getting bucket state: %v", err)
+                        // Continue with default values
+                }</span>
+
+                // Parse current state for response header
+                <span class="cov8" title="1">var remaining int
+                if len(bucketData) &gt; 0 &amp;&amp; bucketData[0] != nil </span><span class="cov8" title="1">{
+                        if algorithm == "token" </span><span class="cov8" title="1">{
+                                // For token bucket, remaining = tokens left
+                                if tokens, err := strconv.ParseFloat(bucketData[0].(string), 64); err == nil </span><span class="cov8" title="1">{
+                                        remaining = int(tokens)
+                                }</span>
+                        } else<span class="cov8" title="1"> {
+                                // For leaky bucket, remaining = capacity - current volume
+                                if volume, err := strconv.ParseFloat(bucketData[0].(string), 64); err == nil </span><span class="cov8" title="1">{
+                                        remaining = bucketCapacity - int(volume)
+                                }</span>
+                        }
+                }
+
+                // Calculate next available time (approximate)
+                <span class="cov8" title="1">nextAvailableSeconds := int64(1.0 / rate)
+                nextAvailable := now + nextAvailableSeconds
+
+                // Set response headers for successful request
                 w.Header().Set("X-RateLimit-Limit", strconv.Itoa(bucketCapacity))
-                w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(tokens))
-                w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(lastRefill+int64(refillInterval.Seconds()), 10))
+                w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+                w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(nextAvailable, 10))
+                w.Header().Set("X-RateLimit-Algorithm", algorithm+" bucket")
 
                 w.WriteHeader(http.StatusOK)
-                w.Write([]byte("allowed"))
-        }</span> else<span class="cov8" title="1"> {
+                w.Write([]byte("allowed"))</span>
+        } else<span class="cov8" title="1"> {
+                // Calculate retry after time
+                retryAfterSeconds := int(1.0 / rate)
+
                 // Set response headers for rate limit exceeded
                 w.Header().Set("X-RateLimit-Limit", strconv.Itoa(bucketCapacity))
                 w.Header().Set("X-RateLimit-Remaining", "0")
-                w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(lastRefill+int64(refillInterval.Seconds()), 10))
-                w.Header().Set("Retry-After", strconv.Itoa(int(refillInterval.Seconds())))
+                w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(now+int64(retryAfterSeconds), 10))
+                w.Header().Set("X-RateLimit-Algorithm", algorithm+" bucket")
+                w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 
                 w.WriteHeader(http.StatusTooManyRequests)
                 w.Write([]byte("rate limit exceeded"))
@@ -204,6 +287,170 @@ func healthHandler(w http.ResponseWriter, r *http.Request) <span class="cov8" ti
 
         <span class="cov8" title="1">w.WriteHeader(http.StatusOK)
         w.Write([]byte("OK"))</span>
+}
+
+func userManagementHandler(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
+        switch r.Method </span>{
+        case "GET":<span class="cov8" title="1">
+                getUserInfo(w, r)</span>
+        case "POST":<span class="cov8" title="1">
+                updateUserLimits(w, r)</span>
+        case "DELETE":<span class="cov8" title="1">
+                deleteUser(w, r)</span>
+        default:<span class="cov8" title="1">
+                http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)</span>
+        }
+}
+
+func getUserInfo(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
+        userID := r.URL.Query().Get("user_id")
+        if userID == "" </span><span class="cov8" title="1">{
+                http.Error(w, "user_id required", http.StatusBadRequest)
+                return
+        }</span>
+
+        // Check if user exists
+        <span class="cov8" title="1">userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
+        usersSetKey := "ratelimit:users"
+
+        exists, err := rdb.SIsMember(ctx, usersSetKey, userID).Result()
+        if err != nil </span><span class="cov0" title="0">{
+                http.Error(w, "internal server error", http.StatusInternalServerError)
+                return
+        }</span>
+
+        <span class="cov8" title="1">if !exists </span><span class="cov8" title="1">{
+                w.WriteHeader(http.StatusNotFound)
+                w.Write([]byte("User not found"))
+                return
+        }</span>
+
+        // Get user configuration
+        <span class="cov8" title="1">userConfig, err := rdb.HMGet(ctx, userConfigKey, "max_tokens", "refill_rate", "capacity", "leak_rate", "created_at").Result()
+        if err != nil </span><span class="cov0" title="0">{
+                http.Error(w, "internal server error", http.StatusInternalServerError)
+                return
+        }</span>
+
+        <span class="cov8" title="1">w.Header().Set("Content-Type", "application/json")
+        if algorithm == "token" </span><span class="cov8" title="1">{
+                fmt.Fprintf(w, `{"user_id": "%s", "algorithm": "%s", "max_tokens": %s, "refill_rate": %s, "created_at": %s}`,
+                        userID, algorithm, userConfig[0], userConfig[1], userConfig[4])
+        }</span> else<span class="cov8" title="1"> {
+                fmt.Fprintf(w, `{"user_id": "%s", "algorithm": "%s", "capacity": %s, "leak_rate": %s, "created_at": %s}`,
+                        userID, algorithm, userConfig[2], userConfig[3], userConfig[4])
+        }</span>
+}
+
+func updateUserLimits(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
+        userID := r.URL.Query().Get("user_id")
+        if userID == "" </span><span class="cov8" title="1">{
+                http.Error(w, "user_id required", http.StatusBadRequest)
+                return
+        }</span>
+
+        // Parse limit parameters
+        <span class="cov8" title="1">var userCapacity, userRate float64
+        var err error
+
+        if algorithm == "token" </span><span class="cov8" title="1">{
+                if maxTokensStr := r.URL.Query().Get("max_tokens"); maxTokensStr != "" </span><span class="cov8" title="1">{
+                        userCapacity, err = strconv.ParseFloat(maxTokensStr, 64)
+                        if err != nil </span><span class="cov8" title="1">{
+                                http.Error(w, "invalid max_tokens", http.StatusBadRequest)
+                                return
+                        }</span>
+                } else<span class="cov8" title="1"> {
+                        userCapacity = float64(bucketCapacity)
+                }</span>
+
+                <span class="cov8" title="1">if refillRateStr := r.URL.Query().Get("refill_rate"); refillRateStr != "" </span><span class="cov8" title="1">{
+                        userRate, err = strconv.ParseFloat(refillRateStr, 64)
+                        if err != nil </span><span class="cov8" title="1">{
+                                http.Error(w, "invalid refill_rate", http.StatusBadRequest)
+                                return
+                        }</span>
+                } else<span class="cov0" title="0"> {
+                        userRate = rate
+                }</span>
+        } else<span class="cov8" title="1"> {
+                if capacityStr := r.URL.Query().Get("capacity"); capacityStr != "" </span><span class="cov8" title="1">{
+                        userCapacity, err = strconv.ParseFloat(capacityStr, 64)
+                        if err != nil </span><span class="cov0" title="0">{
+                                http.Error(w, "invalid capacity", http.StatusBadRequest)
+                                return
+                        }</span>
+                } else<span class="cov0" title="0"> {
+                        userCapacity = float64(bucketCapacity)
+                }</span>
+
+                <span class="cov8" title="1">if leakRateStr := r.URL.Query().Get("leak_rate"); leakRateStr != "" </span><span class="cov8" title="1">{
+                        userRate, err = strconv.ParseFloat(leakRateStr, 64)
+                        if err != nil </span><span class="cov0" title="0">{
+                                http.Error(w, "invalid leak_rate", http.StatusBadRequest)
+                                return
+                        }</span>
+                } else<span class="cov0" title="0"> {
+                        userRate = rate
+                }</span>
+        }
+
+        // Update user configuration
+        <span class="cov8" title="1">userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
+        usersSetKey := "ratelimit:users"
+        now := time.Now().Unix()
+
+        // Add user to users set if not exists
+        rdb.SAdd(ctx, usersSetKey, userID)
+
+        // Update user configuration based on algorithm
+        if algorithm == "token" </span><span class="cov8" title="1">{
+                err = rdb.HMSet(ctx, userConfigKey,
+                        "max_tokens", userCapacity,
+                        "refill_rate", userRate,
+                        "updated_at", now).Err()
+        }</span> else<span class="cov8" title="1"> {
+                err = rdb.HMSet(ctx, userConfigKey,
+                        "capacity", userCapacity,
+                        "leak_rate", userRate,
+                        "updated_at", now).Err()
+        }</span>
+
+        <span class="cov8" title="1">if err != nil </span><span class="cov0" title="0">{
+                http.Error(w, "failed to update user", http.StatusInternalServerError)
+                return
+        }</span>
+
+        // Set expiration for user config (24 hours)
+        <span class="cov8" title="1">rdb.Expire(ctx, userConfigKey, 24*time.Hour)
+
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte("User limits updated successfully"))</span>
+}
+
+func deleteUser(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
+        userID := r.URL.Query().Get("user_id")
+        if userID == "" </span><span class="cov0" title="0">{
+                http.Error(w, "user_id required", http.StatusBadRequest)
+                return
+        }</span>
+
+        // Remove user from users set
+        <span class="cov8" title="1">usersSetKey := "ratelimit:users"
+        userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
+        bucketKey := fmt.Sprintf("ratelimit:%s:%s", algorithm, userID)
+
+        // Remove from set
+        rdb.SRem(ctx, usersSetKey, userID)
+
+        // Delete user configuration
+        rdb.Del(ctx, userConfigKey)
+
+        // Delete user bucket
+        rdb.Del(ctx, bucketKey)
+
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte("User deleted successfully"))</span>
 }
 </pre>
 		

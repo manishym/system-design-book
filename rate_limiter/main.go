@@ -88,6 +88,7 @@ func main() {
 	// Setup HTTP handlers
 	http.HandleFunc("/check", rateLimitHandler)
 	http.HandleFunc("/health", healthHandler)
+	http.HandleFunc("/users", userManagementHandler)
 
 	log.Printf("Rate limiter running on port %s", serverPort)
 	log.Fatal(http.ListenAndServe(":"+serverPort, nil))
@@ -128,12 +129,13 @@ func rateLimitHandler(w http.ResponseWriter, r *http.Request) {
 	// Execute the rate limiting Lua script
 	// Both scripts use the same parameters:
 	// KEYS[1]: Redis key
-	// ARGV[1]: bucket capacity
-	// ARGV[2]: rate (refill rate for token bucket, leak rate for leaky bucket)
+	// ARGV[1]: default bucket capacity (used for new users)
+	// ARGV[2]: default rate (refill rate for token bucket, leak rate for leaky bucket, used for new users)
 	// ARGV[3]: requests (usually 1)
 	// ARGV[4]: current timestamp (in seconds)
+	// ARGV[5]: user ID
 	result, err := rateLimitScript.Run(ctx, rdb, []string{key},
-		bucketCapacity, rate, 1, now).Result()
+		bucketCapacity, rate, 1, now, userID).Result()
 
 	if err != nil {
 		log.Printf("Error executing %s bucket script: %v", algorithm, err)
@@ -214,4 +216,168 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
+}
+
+func userManagementHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		getUserInfo(w, r)
+	case "POST":
+		updateUserLimits(w, r)
+	case "DELETE":
+		deleteUser(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func getUserInfo(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "user_id required", http.StatusBadRequest)
+		return
+	}
+
+	// Check if user exists
+	userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
+	usersSetKey := "ratelimit:users"
+
+	exists, err := rdb.SIsMember(ctx, usersSetKey, userID).Result()
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if !exists {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("User not found"))
+		return
+	}
+
+	// Get user configuration
+	userConfig, err := rdb.HMGet(ctx, userConfigKey, "max_tokens", "refill_rate", "capacity", "leak_rate", "created_at").Result()
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if algorithm == "token" {
+		fmt.Fprintf(w, `{"user_id": "%s", "algorithm": "%s", "max_tokens": %s, "refill_rate": %s, "created_at": %s}`,
+			userID, algorithm, userConfig[0], userConfig[1], userConfig[4])
+	} else {
+		fmt.Fprintf(w, `{"user_id": "%s", "algorithm": "%s", "capacity": %s, "leak_rate": %s, "created_at": %s}`,
+			userID, algorithm, userConfig[2], userConfig[3], userConfig[4])
+	}
+}
+
+func updateUserLimits(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "user_id required", http.StatusBadRequest)
+		return
+	}
+
+	// Parse limit parameters
+	var userCapacity, userRate float64
+	var err error
+
+	if algorithm == "token" {
+		if maxTokensStr := r.URL.Query().Get("max_tokens"); maxTokensStr != "" {
+			userCapacity, err = strconv.ParseFloat(maxTokensStr, 64)
+			if err != nil {
+				http.Error(w, "invalid max_tokens", http.StatusBadRequest)
+				return
+			}
+		} else {
+			userCapacity = float64(bucketCapacity)
+		}
+
+		if refillRateStr := r.URL.Query().Get("refill_rate"); refillRateStr != "" {
+			userRate, err = strconv.ParseFloat(refillRateStr, 64)
+			if err != nil {
+				http.Error(w, "invalid refill_rate", http.StatusBadRequest)
+				return
+			}
+		} else {
+			userRate = rate
+		}
+	} else {
+		if capacityStr := r.URL.Query().Get("capacity"); capacityStr != "" {
+			userCapacity, err = strconv.ParseFloat(capacityStr, 64)
+			if err != nil {
+				http.Error(w, "invalid capacity", http.StatusBadRequest)
+				return
+			}
+		} else {
+			userCapacity = float64(bucketCapacity)
+		}
+
+		if leakRateStr := r.URL.Query().Get("leak_rate"); leakRateStr != "" {
+			userRate, err = strconv.ParseFloat(leakRateStr, 64)
+			if err != nil {
+				http.Error(w, "invalid leak_rate", http.StatusBadRequest)
+				return
+			}
+		} else {
+			userRate = rate
+		}
+	}
+
+	// Update user configuration
+	userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
+	usersSetKey := "ratelimit:users"
+	now := time.Now().Unix()
+
+	// Add user to users set if not exists
+	rdb.SAdd(ctx, usersSetKey, userID)
+
+	// Update user configuration based on algorithm
+	if algorithm == "token" {
+		err = rdb.HMSet(ctx, userConfigKey,
+			"max_tokens", userCapacity,
+			"refill_rate", userRate,
+			"updated_at", now).Err()
+	} else {
+		err = rdb.HMSet(ctx, userConfigKey,
+			"capacity", userCapacity,
+			"leak_rate", userRate,
+			"updated_at", now).Err()
+	}
+
+	if err != nil {
+		http.Error(w, "failed to update user", http.StatusInternalServerError)
+		return
+	}
+
+	// Set expiration for user config (24 hours)
+	rdb.Expire(ctx, userConfigKey, 24*time.Hour)
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("User limits updated successfully"))
+}
+
+func deleteUser(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "user_id required", http.StatusBadRequest)
+		return
+	}
+
+	// Remove user from users set
+	usersSetKey := "ratelimit:users"
+	userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
+	bucketKey := fmt.Sprintf("ratelimit:%s:%s", algorithm, userID)
+
+	// Remove from set
+	rdb.SRem(ctx, usersSetKey, userID)
+
+	// Delete user configuration
+	rdb.Del(ctx, userConfigKey)
+
+	// Delete user bucket
+	rdb.Del(ctx, bucketKey)
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("User deleted successfully"))
 }

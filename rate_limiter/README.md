@@ -72,3 +72,80 @@ A high-performance rate limiting system that controls API request rates using va
 - Tracks rate limiting metrics
 - Generates reports and insights
 - Monitors system performance
+
+## Multi-User Support
+
+The rate limiter now supports multiple users with automatic user creation and individual rate limits:
+
+### Features
+- **Automatic User Creation**: New users are automatically added to Redis when they make their first request
+- **Default Limits**: New users are initialized with default rate limits (configurable via command line flags)
+- **User-Specific Limits**: Individual users can have custom rate limits different from defaults
+- **User Management API**: REST endpoints to manage user configurations
+
+### API Endpoints
+
+#### Rate Limiting
+```bash
+# Check rate limit for a user (auto-creates user if doesn't exist)
+GET /check?user_id={user_id}
+```
+
+#### User Management
+```bash
+# Get user information and current limits
+GET /users?user_id={user_id}
+
+# Set custom limits for a user (Token Bucket)
+POST /users?user_id={user_id}&max_tokens={tokens}&refill_rate={rate}
+
+# Set custom limits for a user (Leaky Bucket)  
+POST /users?user_id={user_id}&capacity={capacity}&leak_rate={rate}
+
+# Delete a user and their data
+DELETE /users?user_id={user_id}
+```
+
+### Usage Examples
+
+#### Basic Rate Limiting
+```bash
+# First request for new user "alice" - auto-creates with default limits
+curl "http://localhost:8080/check?user_id=alice"
+
+# Subsequent requests use the same user's bucket
+curl "http://localhost:8080/check?user_id=alice"
+```
+
+#### User Management
+```bash
+# Set custom token bucket limits for alice
+curl -X POST "http://localhost:8080/users?user_id=alice&max_tokens=10&refill_rate=2"
+
+# Get alice's current configuration
+curl "http://localhost:8080/users?user_id=alice"
+
+# Delete alice's data
+curl -X DELETE "http://localhost:8080/users?user_id=alice"
+```
+
+### Redis Data Structure
+
+#### User Set
+- Key: `ratelimit:users`
+- Type: Set
+- Contains: List of all user IDs
+
+#### User Configuration
+- Key: `ratelimit:users:{user_id}`
+- Type: Hash
+- Fields:
+  - `max_tokens` / `capacity`: Maximum tokens/capacity for the user
+  - `refill_rate` / `leak_rate`: Rate for token refill or leaking
+  - `created_at`: User creation timestamp
+  - `updated_at`: Last configuration update timestamp
+
+#### User Bucket State
+- Key: `ratelimit:{algorithm}:{user_id}`
+- Type: Hash
+- Fields depend on algorithm (tokens/volume, last/last_leak)
