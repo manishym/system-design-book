@@ -55,15 +55,24 @@
 			<div id="nav">
 				<select id="files">
 				
-				<option value="file0">rate-limiter/main.go (73.3%)</option>
+				<option value="file0">rate-limiter/main.go (8.9%)</option>
 				
 				</select>
 			</div>
 			<div id="legend">
 				<span>not tracked</span>
 			
-				<span class="cov0">not covered</span>
-				<span class="cov8">covered</span>
+				<span class="cov0">no coverage</span>
+				<span class="cov1">low coverage</span>
+				<span class="cov2">*</span>
+				<span class="cov3">*</span>
+				<span class="cov4">*</span>
+				<span class="cov5">*</span>
+				<span class="cov6">*</span>
+				<span class="cov7">*</span>
+				<span class="cov8">*</span>
+				<span class="cov9">*</span>
+				<span class="cov10">high coverage</span>
 			
 			</div>
 		</div>
@@ -165,22 +174,22 @@ func main() <span class="cov0" title="0">{
         log.Fatal(http.ListenAndServe(":"+serverPort, nil))</span>
 }
 
-func loadRateLimitScript() error <span class="cov8" title="1">{
+func loadRateLimitScript() error <span class="cov0" title="0">{
         var scriptFile string
-        if algorithm == "token" </span><span class="cov8" title="1">{
+        if algorithm == "token" </span><span class="cov0" title="0">{
                 scriptFile = "token_bucket.lua"
-        }</span> else<span class="cov8" title="1"> {
+        }</span> else<span class="cov0" title="0"> {
                 scriptFile = "leaky_bucket.lua"
         }</span>
 
         // Read the Lua script from file
-        <span class="cov8" title="1">scriptContent, err := ioutil.ReadFile(scriptFile)
+        <span class="cov0" title="0">scriptContent, err := ioutil.ReadFile(scriptFile)
         if err != nil </span><span class="cov0" title="0">{
                 return fmt.Errorf("failed to read %s: %w", scriptFile, err)
         }</span>
 
         // Create Redis script object
-        <span class="cov8" title="1">rateLimitScript = redis.NewScript(string(scriptContent))
+        <span class="cov0" title="0">rateLimitScript = redis.NewScript(string(scriptContent))
         return nil</span>
 }
 
@@ -192,7 +201,7 @@ func rateLimitHandler(w http.ResponseWriter, r *http.Request) <span class="cov8"
         }</span>
 
         // Redis key for this user's bucket
-        <span class="cov8" title="1">key := fmt.Sprintf("ratelimit:%s:%s", algorithm, userID)
+        <span class="cov0" title="0">key := fmt.Sprintf("ratelimit:%s:%s", algorithm, userID)
 
         // Current timestamp in seconds
         now := time.Now().Unix()
@@ -215,41 +224,41 @@ func rateLimitHandler(w http.ResponseWriter, r *http.Request) <span class="cov8"
         }</span>
 
         // The script returns 1 for allowed, 0 for denied
-        <span class="cov8" title="1">allowed := result.(int64) == 1
+        <span class="cov0" title="0">allowed := result.(int64) == 1
 
-        if allowed </span><span class="cov8" title="1">{
+        if allowed </span><span class="cov0" title="0">{
                 // Get current bucket state for response headers
                 var stateFields []string
-                if algorithm == "token" </span><span class="cov8" title="1">{
+                if algorithm == "token" </span><span class="cov0" title="0">{
                         stateFields = []string{"tokens", "last"}
-                }</span> else<span class="cov8" title="1"> {
+                }</span> else<span class="cov0" title="0"> {
                         stateFields = []string{"volume", "last_leak"}
                 }</span>
 
-                <span class="cov8" title="1">bucketData, err := rdb.HMGet(ctx, key, stateFields...).Result()
+                <span class="cov0" title="0">bucketData, err := rdb.HMGet(ctx, key, stateFields...).Result()
                 if err != nil </span><span class="cov0" title="0">{
                         log.Printf("Error getting bucket state: %v", err)
                         // Continue with default values
                 }</span>
 
                 // Parse current state for response header
-                <span class="cov8" title="1">var remaining int
-                if len(bucketData) &gt; 0 &amp;&amp; bucketData[0] != nil </span><span class="cov8" title="1">{
-                        if algorithm == "token" </span><span class="cov8" title="1">{
+                <span class="cov0" title="0">var remaining int
+                if len(bucketData) &gt; 0 &amp;&amp; bucketData[0] != nil </span><span class="cov0" title="0">{
+                        if algorithm == "token" </span><span class="cov0" title="0">{
                                 // For token bucket, remaining = tokens left
-                                if tokens, err := strconv.ParseFloat(bucketData[0].(string), 64); err == nil </span><span class="cov8" title="1">{
+                                if tokens, err := strconv.ParseFloat(bucketData[0].(string), 64); err == nil </span><span class="cov0" title="0">{
                                         remaining = int(tokens)
                                 }</span>
-                        } else<span class="cov8" title="1"> {
+                        } else<span class="cov0" title="0"> {
                                 // For leaky bucket, remaining = capacity - current volume
-                                if volume, err := strconv.ParseFloat(bucketData[0].(string), 64); err == nil </span><span class="cov8" title="1">{
+                                if volume, err := strconv.ParseFloat(bucketData[0].(string), 64); err == nil </span><span class="cov0" title="0">{
                                         remaining = bucketCapacity - int(volume)
                                 }</span>
                         }
                 }
 
                 // Calculate next available time (approximate)
-                <span class="cov8" title="1">nextAvailableSeconds := int64(1.0 / rate)
+                <span class="cov0" title="0">nextAvailableSeconds := int64(1.0 / rate)
                 nextAvailable := now + nextAvailableSeconds
 
                 // Set response headers for successful request
@@ -260,7 +269,7 @@ func rateLimitHandler(w http.ResponseWriter, r *http.Request) <span class="cov8"
 
                 w.WriteHeader(http.StatusOK)
                 w.Write([]byte("allowed"))</span>
-        } else<span class="cov8" title="1"> {
+        } else<span class="cov0" title="0"> {
                 // Calculate retry after time
                 retryAfterSeconds := int(1.0 / rate)
 
@@ -285,32 +294,32 @@ func healthHandler(w http.ResponseWriter, r *http.Request) <span class="cov8" ti
                 return
         }</span>
 
-        <span class="cov8" title="1">w.WriteHeader(http.StatusOK)
+        <span class="cov0" title="0">w.WriteHeader(http.StatusOK)
         w.Write([]byte("OK"))</span>
 }
 
-func userManagementHandler(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
+func userManagementHandler(w http.ResponseWriter, r *http.Request) <span class="cov0" title="0">{
         switch r.Method </span>{
-        case "GET":<span class="cov8" title="1">
+        case "GET":<span class="cov0" title="0">
                 getUserInfo(w, r)</span>
-        case "POST":<span class="cov8" title="1">
+        case "POST":<span class="cov0" title="0">
                 updateUserLimits(w, r)</span>
-        case "DELETE":<span class="cov8" title="1">
+        case "DELETE":<span class="cov0" title="0">
                 deleteUser(w, r)</span>
-        default:<span class="cov8" title="1">
+        default:<span class="cov0" title="0">
                 http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)</span>
         }
 }
 
-func getUserInfo(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
+func getUserInfo(w http.ResponseWriter, r *http.Request) <span class="cov0" title="0">{
         userID := r.URL.Query().Get("user_id")
-        if userID == "" </span><span class="cov8" title="1">{
+        if userID == "" </span><span class="cov0" title="0">{
                 http.Error(w, "user_id required", http.StatusBadRequest)
                 return
         }</span>
 
         // Check if user exists
-        <span class="cov8" title="1">userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
+        <span class="cov0" title="0">userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
         usersSetKey := "ratelimit:users"
 
         exists, err := rdb.SIsMember(ctx, usersSetKey, userID).Result()
@@ -319,62 +328,73 @@ func getUserInfo(w http.ResponseWriter, r *http.Request) <span class="cov8" titl
                 return
         }</span>
 
-        <span class="cov8" title="1">if !exists </span><span class="cov8" title="1">{
+        <span class="cov0" title="0">if !exists </span><span class="cov0" title="0">{
                 w.WriteHeader(http.StatusNotFound)
                 w.Write([]byte("User not found"))
                 return
         }</span>
 
         // Get user configuration
-        <span class="cov8" title="1">userConfig, err := rdb.HMGet(ctx, userConfigKey, "max_tokens", "refill_rate", "capacity", "leak_rate", "created_at").Result()
+        <span class="cov0" title="0">userConfig, err := rdb.HMGet(ctx, userConfigKey, "max_tokens", "refill_rate", "capacity", "leak_rate", "created_at").Result()
         if err != nil </span><span class="cov0" title="0">{
                 http.Error(w, "internal server error", http.StatusInternalServerError)
                 return
         }</span>
 
-        <span class="cov8" title="1">w.Header().Set("Content-Type", "application/json")
-        if algorithm == "token" </span><span class="cov8" title="1">{
+        <span class="cov0" title="0">w.Header().Set("Content-Type", "application/json")
+
+        // Helper function to safely get string value or null
+        safeValue := func(val interface{}) string </span><span class="cov0" title="0">{
+                if val == nil </span><span class="cov0" title="0">{
+                        return "null"
+                }</span>
+                <span class="cov0" title="0">return fmt.Sprintf(`"%s"`, val)</span>
+        }
+
+        <span class="cov0" title="0">if algorithm == "token" </span><span class="cov0" title="0">{
                 fmt.Fprintf(w, `{"user_id": "%s", "algorithm": "%s", "max_tokens": %s, "refill_rate": %s, "created_at": %s}`,
-                        userID, algorithm, userConfig[0], userConfig[1], userConfig[4])
-        }</span> else<span class="cov8" title="1"> {
+                        userID, algorithm,
+                        safeValue(userConfig[0]), safeValue(userConfig[1]), safeValue(userConfig[4]))
+        }</span> else<span class="cov0" title="0"> {
                 fmt.Fprintf(w, `{"user_id": "%s", "algorithm": "%s", "capacity": %s, "leak_rate": %s, "created_at": %s}`,
-                        userID, algorithm, userConfig[2], userConfig[3], userConfig[4])
+                        userID, algorithm,
+                        safeValue(userConfig[2]), safeValue(userConfig[3]), safeValue(userConfig[4]))
         }</span>
 }
 
-func updateUserLimits(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
+func updateUserLimits(w http.ResponseWriter, r *http.Request) <span class="cov0" title="0">{
         userID := r.URL.Query().Get("user_id")
-        if userID == "" </span><span class="cov8" title="1">{
+        if userID == "" </span><span class="cov0" title="0">{
                 http.Error(w, "user_id required", http.StatusBadRequest)
                 return
         }</span>
 
         // Parse limit parameters
-        <span class="cov8" title="1">var userCapacity, userRate float64
+        <span class="cov0" title="0">var userCapacity, userRate float64
         var err error
 
-        if algorithm == "token" </span><span class="cov8" title="1">{
-                if maxTokensStr := r.URL.Query().Get("max_tokens"); maxTokensStr != "" </span><span class="cov8" title="1">{
+        if algorithm == "token" </span><span class="cov0" title="0">{
+                if maxTokensStr := r.URL.Query().Get("max_tokens"); maxTokensStr != "" </span><span class="cov0" title="0">{
                         userCapacity, err = strconv.ParseFloat(maxTokensStr, 64)
-                        if err != nil </span><span class="cov8" title="1">{
+                        if err != nil </span><span class="cov0" title="0">{
                                 http.Error(w, "invalid max_tokens", http.StatusBadRequest)
                                 return
                         }</span>
-                } else<span class="cov8" title="1"> {
+                } else<span class="cov0" title="0"> {
                         userCapacity = float64(bucketCapacity)
                 }</span>
 
-                <span class="cov8" title="1">if refillRateStr := r.URL.Query().Get("refill_rate"); refillRateStr != "" </span><span class="cov8" title="1">{
+                <span class="cov0" title="0">if refillRateStr := r.URL.Query().Get("refill_rate"); refillRateStr != "" </span><span class="cov0" title="0">{
                         userRate, err = strconv.ParseFloat(refillRateStr, 64)
-                        if err != nil </span><span class="cov8" title="1">{
+                        if err != nil </span><span class="cov0" title="0">{
                                 http.Error(w, "invalid refill_rate", http.StatusBadRequest)
                                 return
                         }</span>
                 } else<span class="cov0" title="0"> {
                         userRate = rate
                 }</span>
-        } else<span class="cov8" title="1"> {
-                if capacityStr := r.URL.Query().Get("capacity"); capacityStr != "" </span><span class="cov8" title="1">{
+        } else<span class="cov0" title="0"> {
+                if capacityStr := r.URL.Query().Get("capacity"); capacityStr != "" </span><span class="cov0" title="0">{
                         userCapacity, err = strconv.ParseFloat(capacityStr, 64)
                         if err != nil </span><span class="cov0" title="0">{
                                 http.Error(w, "invalid capacity", http.StatusBadRequest)
@@ -384,7 +404,7 @@ func updateUserLimits(w http.ResponseWriter, r *http.Request) <span class="cov8"
                         userCapacity = float64(bucketCapacity)
                 }</span>
 
-                <span class="cov8" title="1">if leakRateStr := r.URL.Query().Get("leak_rate"); leakRateStr != "" </span><span class="cov8" title="1">{
+                <span class="cov0" title="0">if leakRateStr := r.URL.Query().Get("leak_rate"); leakRateStr != "" </span><span class="cov0" title="0">{
                         userRate, err = strconv.ParseFloat(leakRateStr, 64)
                         if err != nil </span><span class="cov0" title="0">{
                                 http.Error(w, "invalid leak_rate", http.StatusBadRequest)
@@ -396,7 +416,7 @@ func updateUserLimits(w http.ResponseWriter, r *http.Request) <span class="cov8"
         }
 
         // Update user configuration
-        <span class="cov8" title="1">userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
+        <span class="cov0" title="0">userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
         usersSetKey := "ratelimit:users"
         now := time.Now().Unix()
 
@@ -404,31 +424,31 @@ func updateUserLimits(w http.ResponseWriter, r *http.Request) <span class="cov8"
         rdb.SAdd(ctx, usersSetKey, userID)
 
         // Update user configuration based on algorithm
-        if algorithm == "token" </span><span class="cov8" title="1">{
+        if algorithm == "token" </span><span class="cov0" title="0">{
                 err = rdb.HMSet(ctx, userConfigKey,
                         "max_tokens", userCapacity,
                         "refill_rate", userRate,
                         "updated_at", now).Err()
-        }</span> else<span class="cov8" title="1"> {
+        }</span> else<span class="cov0" title="0"> {
                 err = rdb.HMSet(ctx, userConfigKey,
                         "capacity", userCapacity,
                         "leak_rate", userRate,
                         "updated_at", now).Err()
         }</span>
 
-        <span class="cov8" title="1">if err != nil </span><span class="cov0" title="0">{
+        <span class="cov0" title="0">if err != nil </span><span class="cov0" title="0">{
                 http.Error(w, "failed to update user", http.StatusInternalServerError)
                 return
         }</span>
 
         // Set expiration for user config (24 hours)
-        <span class="cov8" title="1">rdb.Expire(ctx, userConfigKey, 24*time.Hour)
+        <span class="cov0" title="0">rdb.Expire(ctx, userConfigKey, 24*time.Hour)
 
         w.WriteHeader(http.StatusOK)
         w.Write([]byte("User limits updated successfully"))</span>
 }
 
-func deleteUser(w http.ResponseWriter, r *http.Request) <span class="cov8" title="1">{
+func deleteUser(w http.ResponseWriter, r *http.Request) <span class="cov0" title="0">{
         userID := r.URL.Query().Get("user_id")
         if userID == "" </span><span class="cov0" title="0">{
                 http.Error(w, "user_id required", http.StatusBadRequest)
@@ -436,7 +456,7 @@ func deleteUser(w http.ResponseWriter, r *http.Request) <span class="cov8" title
         }</span>
 
         // Remove user from users set
-        <span class="cov8" title="1">usersSetKey := "ratelimit:users"
+        <span class="cov0" title="0">usersSetKey := "ratelimit:users"
         userConfigKey := fmt.Sprintf("ratelimit:users:%s", userID)
         bucketKey := fmt.Sprintf("ratelimit:%s:%s", algorithm, userID)
 

@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rate-limiter
+spec:
+  replicas: 1  # Use only 1 replica for CI testing
+  selector:
+    matchLabels:
+      app: rate-limiter
+  template:
+    metadata:
+      labels:
+        app: rate-limiter
+    spec:
+      containers:
+      - name: rate-limiter
+        image: rate-limiter:test  # Use the test image built in CI
+        imagePullPolicy: Never   # Don't try to pull from registry
+        ports:
+        - containerPort: 8080
+        command: ["./rate-limiter"]
+        env:
+        - name: REDIS_ADDR
+          value: "redis-master:6379"  # Connect to Redis deployed by Helm
+        args:
+        - "--redis-addr=redis-master:6379"
+        - "--algorithm=token"
+        - "--bucket-capacity=5"
+        - "--rate=1"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10 

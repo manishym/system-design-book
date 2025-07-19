@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
@@ -337,29 +338,40 @@ func TestMultiUserLeakyBucket(t *testing.T) {
 	userA := "user_a_leaky"
 	userB := "user_b_leaky"
 
-	// Clean up any existing state
+	// Clean up any existing state more thoroughly
 	keyA := "ratelimit:leaky:" + userA
 	keyB := "ratelimit:leaky:" + userB
-	rdb.Del(ctx, keyA, keyB)
-	rdb.Del(ctx, "ratelimit:users:"+userA, "ratelimit:users:"+userB)
-	rdb.SRem(ctx, "ratelimit:users", userA, userB)
 
-	// Test 1: User A fills bucket
+	// Multiple cleanup attempts to handle CI timing issues
+	for i := 0; i < 3; i++ {
+		rdb.Del(ctx, keyA, keyB)
+		rdb.Del(ctx, "ratelimit:users:"+userA, "ratelimit:users:"+userB)
+		rdb.SRem(ctx, "ratelimit:users", userA, userB)
+		// Small delay to ensure cleanup completes
+		if i < 2 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Test 1: User A fills bucket (capacity=2)
 	req1 := httptest.NewRequest("GET", "/check?user_id="+userA, nil)
 	w1 := httptest.NewRecorder()
 	rateLimitHandler(w1, req1)
-	assert.Equal(t, http.StatusOK, w1.Code)
+	assert.Equal(t, http.StatusOK, w1.Code, "First request should be allowed")
 
 	req2 := httptest.NewRequest("GET", "/check?user_id="+userA, nil)
 	w2 := httptest.NewRecorder()
 	rateLimitHandler(w2, req2)
-	assert.Equal(t, http.StatusOK, w2.Code)
+	assert.Equal(t, http.StatusOK, w2.Code, "Second request should be allowed")
 
-	// User A bucket should be full now
+	// User A bucket should be full now (capacity=2, so 3rd request should be denied)
 	req3 := httptest.NewRequest("GET", "/check?user_id="+userA, nil)
 	w3 := httptest.NewRecorder()
 	rateLimitHandler(w3, req3)
-	assert.Equal(t, http.StatusTooManyRequests, w3.Code)
+
+	// This is the critical assertion that was failing in CI
+	assert.Equal(t, http.StatusTooManyRequests, w3.Code,
+		"Third request should be denied when bucket is at capacity (capacity=%d)", bucketCapacity)
 
 	// Test 2: User B should have independent bucket
 	req4 := httptest.NewRequest("GET", "/check?user_id="+userB, nil)

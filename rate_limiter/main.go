@@ -262,12 +262,23 @@ func getUserInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+
+	// Helper function to safely get string value or null
+	safeValue := func(val interface{}) string {
+		if val == nil {
+			return "null"
+		}
+		return fmt.Sprintf(`"%s"`, val)
+	}
+
 	if algorithm == "token" {
 		fmt.Fprintf(w, `{"user_id": "%s", "algorithm": "%s", "max_tokens": %s, "refill_rate": %s, "created_at": %s}`,
-			userID, algorithm, userConfig[0], userConfig[1], userConfig[4])
+			userID, algorithm,
+			safeValue(userConfig[0]), safeValue(userConfig[1]), safeValue(userConfig[4]))
 	} else {
 		fmt.Fprintf(w, `{"user_id": "%s", "algorithm": "%s", "capacity": %s, "leak_rate": %s, "created_at": %s}`,
-			userID, algorithm, userConfig[2], userConfig[3], userConfig[4])
+			userID, algorithm,
+			safeValue(userConfig[2]), safeValue(userConfig[3]), safeValue(userConfig[4]))
 	}
 }
 
