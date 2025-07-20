@@ -93,10 +93,59 @@ class KVStoreService:
                 logger.error(f"Error retrieving key: {e}")
                 return jsonify({"error": str(e)}), 500
         
+        @self.app.route('/get', methods=['POST'])
+        def get_key_by_body():
+            """Retrieve a value by key (key in POST body for special characters)"""
+            try:
+                data = request.get_json()
+                key = data.get('key')
+                
+                if not key:
+                    return jsonify({"error": "Missing key"}), 400
+                
+                with self.data_lock:
+                    if key in self.data:
+                        return jsonify({
+                            "key": key,
+                            "value": self.data[key],
+                            "node_id": self.node_id
+                        }), 200
+                    else:
+                        return jsonify({"error": "Key not found"}), 404
+                        
+            except Exception as e:
+                logger.error(f"Error retrieving key: {e}")
+                return jsonify({"error": str(e)}), 500
+        
         @self.app.route('/delete/<key>', methods=['DELETE'])
         def delete_key(key):
             """Delete a key-value pair"""
             try:
+                with self.data_lock:
+                    if key in self.data:
+                        del self.data[key]
+                        return jsonify({
+                            "status": "deleted",
+                            "key": key,
+                            "node_id": self.node_id
+                        }), 200
+                    else:
+                        return jsonify({"error": "Key not found"}), 404
+                        
+            except Exception as e:
+                logger.error(f"Error deleting key: {e}")
+                return jsonify({"error": str(e)}), 500
+        
+        @self.app.route('/delete', methods=['POST'])
+        def delete_key_by_body():
+            """Delete a key-value pair (key in POST body for special characters)"""
+            try:
+                data = request.get_json()
+                key = data.get('key')
+                
+                if not key:
+                    return jsonify({"error": "Missing key"}), 400
+                
                 with self.data_lock:
                     if key in self.data:
                         del self.data[key]
@@ -132,12 +181,24 @@ class KVStoreService:
         @self.app.route('/health', methods=['GET'])
         def health_check():
             """Health check endpoint"""
+            # Only return 503 if explicitly stopped (not just not started yet)
+            if hasattr(self, '_explicitly_stopped') and self._explicitly_stopped:
+                return jsonify({"status": "stopping"}), 503
             return jsonify({
                 "status": "healthy",
                 "node_id": self.node_id,
                 "registered": self.registered,
                 "key_count": len(self.data)
             }), 200
+            
+        @self.app.route('/admin/shutdown', methods=['POST'])
+        def shutdown():
+            """Shutdown endpoint for graceful shutdown"""
+            func = request.environ.get('werkzeug.server.shutdown')
+            if func is None:
+                return 'Not running with the Werkzeug Server', 500
+            func()
+            return 'Server shutting down...', 200
         
         @self.app.route('/stats', methods=['GET'])
         def get_stats():
@@ -250,6 +311,16 @@ class KVStoreService:
         """Stop the KV store service"""
         self.running = False
         self.registered = False
+        self._explicitly_stopped = True  # Mark as explicitly stopped for health checks
+        
+        # Try to shutdown Flask server gracefully
+        try:
+            import requests
+            requests.post(f"http://{self.listen_address}:{self.listen_port}/admin/shutdown", timeout=1)
+        except:
+            # If graceful shutdown fails, that's okay - server will stop responding to health checks
+            pass
+            
         logger.info("KV Store service stopped")
 
 
@@ -296,13 +367,27 @@ class KVStoreClient:
             node_info = response.json()["node"]
             node_address = f"{node_info['address']}:{node_info['port']}"
             
-            # Retrieve the value from the responsible node
-            get_response = requests.get(f"http://{node_address}/get/{key}", timeout=5)
+            # Try POST method first (handles special characters)
+            try:
+                get_response = requests.post(
+                    f"http://{node_address}/get",
+                    json={"key": key},
+                    timeout=5
+                )
+                if get_response.status_code == 200:
+                    return get_response.json()["value"]
+            except:
+                pass
             
-            if get_response.status_code == 200:
-                return get_response.json()["value"]
-            else:
-                return None
+            # Fallback to GET method (for backward compatibility)
+            try:
+                get_response = requests.get(f"http://{node_address}/get/{key}", timeout=5)
+                if get_response.status_code == 200:
+                    return get_response.json()["value"]
+            except:
+                pass
+                
+            return None
                 
         except Exception as e:
             logger.error(f"Failed to get key {key}: {e}")
@@ -320,10 +405,24 @@ class KVStoreClient:
             node_info = response.json()["node"]
             node_address = f"{node_info['address']}:{node_info['port']}"
             
-            # Delete the key from the responsible node
-            delete_response = requests.delete(f"http://{node_address}/delete/{key}", timeout=5)
+            # Try POST method first (handles special characters)
+            try:
+                delete_response = requests.post(
+                    f"http://{node_address}/delete",
+                    json={"key": key},
+                    timeout=5
+                )
+                if delete_response.status_code == 200:
+                    return True
+            except:
+                pass
             
-            return delete_response.status_code == 200
+            # Fallback to DELETE method (for backward compatibility)
+            try:
+                delete_response = requests.delete(f"http://{node_address}/delete/{key}", timeout=5)
+                return delete_response.status_code == 200
+            except:
+                return False
             
         except Exception as e:
             logger.error(f"Failed to delete key {key}: {e}")
@@ -333,18 +432,29 @@ class KVStoreClient:
 def main():
     """Main function to run KV store service"""
     import argparse
+    import os
     
-    parser = argparse.ArgumentParser(description='KV Store Service for Consistent Hashing')
-    parser.add_argument('--node-id', required=True, help='Unique node ID')
-    parser.add_argument('--port', type=int, default=8080, help='HTTP port to listen on')
-    parser.add_argument('--gateway', required=True, help='Gateway address (host:port)')
+    # Use environment variables if available, otherwise use command line args
+    node_id = os.getenv('NODE_ID')
+    listen_port = int(os.getenv('LISTEN_PORT', '8080'))
+    gateway_address = os.getenv('GATEWAY_ADDRESS')
     
-    args = parser.parse_args()
+    # If environment variables are not set, parse command line arguments
+    if not node_id or not gateway_address:
+        parser = argparse.ArgumentParser(description='KV Store Service for Consistent Hashing')
+        parser.add_argument('--node-id', required=True, help='Unique node ID')
+        parser.add_argument('--port', type=int, default=8080, help='HTTP port to listen on')
+        parser.add_argument('--gateway', required=True, help='Gateway address (host:port)')
+        
+        args = parser.parse_args()
+        node_id = args.node_id
+        listen_port = args.port
+        gateway_address = args.gateway
     
     kvstore = KVStoreService(
-        node_id=args.node_id,
-        listen_port=args.port,
-        gateway_address=args.gateway
+        node_id=node_id,
+        listen_port=listen_port,
+        gateway_address=gateway_address
     )
     
     try:

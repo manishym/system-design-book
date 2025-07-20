@@ -14,7 +14,10 @@ from typing import Dict, List, Optional, Set
 import uuid
 
 from flask import Flask, request, jsonify
-from simple_hash_ring import SimpleHashRing
+try:
+    from .simple_hash_ring import SimpleHashRing
+except ImportError:
+    from simple_hash_ring import SimpleHashRing
 import requests
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -239,6 +242,77 @@ class SimpleGatewayService:
             except Exception as e:
                 logger.error(f"Error processing gossip: {e}")
                 return jsonify({"error": str(e)}), 500
+        
+        @self.app.route('/health', methods=['GET'])
+        def health_check():
+            """Health check endpoint"""
+            with self.node_lock:
+                return jsonify({
+                    "status": "healthy",
+                    "gateway_id": self.gateway_id,
+                    "nodes_count": len(self.nodes),
+                    "active_nodes": len([n for n in self.nodes.values() if n.status == "active"]),
+                    "timestamp": time.time()
+                }), 200
+                    
+        @self.app.route('/admin/clear_nodes', methods=['POST'])
+        def clear_nodes():
+            """Clear all registered nodes (for testing)"""
+            with self.node_lock:
+                cleared_count = len(self.nodes)
+                self.nodes.clear()
+                self.hash_ring = SimpleHashRing(virtual_nodes=100)  # Use default virtual nodes count
+                logger.info(f"Cleared {cleared_count} nodes from gateway {self.gateway_id}")
+                return jsonify({
+                    "status": "success",
+                    "cleared_nodes": cleared_count,
+                    "gateway_id": self.gateway_id
+                }), 200
+    
+    def _check_node_health(self):
+        """Check health of all nodes and update their status"""
+        current_time = time.time()
+        dead_nodes = []
+        
+        with self.node_lock:
+            logger.info(f"Health check running for {len(self.nodes)} nodes")
+            for node_id, node in self.nodes.items():
+                time_since_heartbeat = current_time - node.last_heartbeat
+                logger.debug(f"Node {node_id}: last heartbeat {time_since_heartbeat:.1f}s ago, status: {node.status}")
+                
+                # Check if node has sent heartbeat recently
+                if time_since_heartbeat > self.heartbeat_timeout:
+                    if node.status != "dead":
+                        logger.warning(f"Node {node_id} heartbeat timeout ({time_since_heartbeat:.1f}s > {self.heartbeat_timeout}s)")
+                        node.status = "dead"
+                        dead_nodes.append(node_id)
+                    continue
+                    
+                # Try to ping the node if heartbeat is still recent
+                try:
+                    health_url = f"http://{node.address}:{node.port}/health"
+                    logger.debug(f"Checking health of {node_id} at {health_url}")
+                    response = requests.get(health_url, timeout=3)
+                    if response.status_code == 200:
+                        if node.status != "active":
+                            logger.info(f"Node {node_id} health check passed - marking as active")
+                        node.status = "active"
+                    else:
+                        if node.status != "dead":
+                            logger.warning(f"Node {node_id} health check failed with status {response.status_code}")
+                            node.status = "dead"
+                            dead_nodes.append(node_id)
+                except Exception as e:
+                    if node.status != "dead":
+                        logger.warning(f"Node {node_id} health check failed: {e}")
+                        node.status = "dead"
+                        dead_nodes.append(node_id)
+        
+        # Remove dead nodes from ring (simplified without Raft)
+        if dead_nodes:
+            logger.info(f"Removing {len(dead_nodes)} dead nodes: {dead_nodes}")
+        for node_id in dead_nodes:
+            self._remove_node_from_ring(node_id)
     
     def _gossip_heartbeat(self, node_id: str, address: str, port: int):
         """Send heartbeat gossip to other gateways"""
@@ -302,20 +376,7 @@ class SimpleGatewayService:
         """Background task to check node health and remove dead nodes"""
         while self.running:
             try:
-                current_time = time.time()
-                dead_nodes = []
-                
-                with self.node_lock:
-                    for node_id, node in self.nodes.items():
-                        if current_time - node.last_heartbeat > self.heartbeat_timeout:
-                            if node.status != "dead":
-                                logger.warning(f"Node {node_id} appears dead")
-                                node.status = "dead"
-                                dead_nodes.append(node_id)
-                
-                # Remove dead nodes (simplified without Raft)
-                for node_id in dead_nodes:
-                    self._remove_node_from_ring(node_id)
+                self._check_node_health()
                     
             except Exception as e:
                 logger.error(f"Health check error: {e}")
@@ -344,18 +405,30 @@ class SimpleGatewayService:
 def main():
     """Main function to run gateway service"""
     import argparse
+    import os
     
-    parser = argparse.ArgumentParser(description='Simplified Gateway Service for Consistent Hashing')
-    parser.add_argument('--gateway-id', required=True, help='Unique gateway ID')
-    parser.add_argument('--port', type=int, default=8000, help='HTTP port to listen on')
-    parser.add_argument('--peers', nargs='*', default=[], help='Peer gateway addresses')
+    # Use environment variables if available, otherwise use command line args
+    gateway_id = os.getenv('GATEWAY_ID')
+    listen_port = int(os.getenv('LISTEN_PORT', '8000'))
+    peer_gateways_str = os.getenv('PEER_GATEWAYS', '')
+    peer_gateways = peer_gateways_str.split() if peer_gateways_str else []
     
-    args = parser.parse_args()
+    # If environment variables are not set, parse command line arguments
+    if not gateway_id:
+        parser = argparse.ArgumentParser(description='Simplified Gateway Service for Consistent Hashing')
+        parser.add_argument('--gateway-id', required=True, help='Unique gateway ID')
+        parser.add_argument('--port', type=int, default=8000, help='HTTP port to listen on')
+        parser.add_argument('--peers', nargs='*', default=[], help='Peer gateway addresses')
+        
+        args = parser.parse_args()
+        gateway_id = args.gateway_id
+        listen_port = args.port
+        peer_gateways = args.peers
     
     gateway = SimpleGatewayService(
-        gateway_id=args.gateway_id,
-        listen_port=args.port,
-        peer_gateways=args.peers
+        gateway_id=gateway_id,
+        listen_port=listen_port,
+        peer_gateways=peer_gateways
     )
     
     try:

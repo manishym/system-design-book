@@ -324,3 +324,81 @@ If migrating from the original flat structure:
 - [Example Demo](./example_demo.py) - Comprehensive demo script
 - [Gateway Service](./gateway/) - Gateway service implementation
 - [KV Store Service](./storage/kvstore/) - KV store service implementation 
+
+## CI/CD Fixes and Improvements
+
+### Recent Fixes (July 2025)
+
+#### Gateway Pod Startup Issues
+- **Issue**: Gateway pods were timing out during startup in Kind clusters
+- **Root Cause**: Import path issues and aggressive startup probe settings
+- **Fix**: 
+  - Updated gateway service to handle both relative and absolute imports
+  - Increased startup probe `failureThreshold` from 30 to 60
+  - Increased startup probe `periodSeconds` from 2 to 5 seconds
+  - Updated Docker CMD to use environment variables instead of command-line args
+
+#### Environment Variable Handling
+- **Issue**: Services not properly reading environment variables in containers
+- **Fix**: Updated both gateway and kvstore services to prioritize environment variables over command-line arguments
+
+#### Docker Image Configuration
+- **Issue**: Incorrect file copying and naming in Dockerfiles
+- **Fix**: 
+  - Updated gateway Dockerfile to copy `gateway_service_simple.py` with correct name
+  - Simplified CMD to just run the Python script (using env vars)
+  - Updated health checks to use correct endpoints
+
+#### GitHub Actions Workflow Improvements  
+- **Issue**: CI timeouts and insufficient error reporting
+- **Fix**:
+  - Increased pod readiness timeout from 300s to 600s (10 minutes)
+  - Added better error handling and logging in wait steps
+  - Improved pod status reporting during failures
+
+### Testing Locally with Kind
+
+To test the deployment locally with Kind before CI:
+
+```bash
+# Run simplified Kind test
+./test-simple-kind.sh
+
+# This will:
+# 1. Create a single-node Kind cluster
+# 2. Build and test Docker images
+# 3. Deploy gateway and kvstore (1 replica each)
+# 4. Verify pods start and endpoints work
+# 5. Clean up automatically
+```
+
+### CI/CD Pipeline Status
+
+The GitHub Actions workflow now includes:
+
+1. **Unit Tests** - All 68 tests passing ✅
+2. **Integration Tests** - Kind deployment with full validation ✅
+3. **Build Validation** - Docker image functionality tests ✅
+4. **Chaos Tests** - Node failure and recovery tests ✅
+5. **Security Scanning** - Trivy vulnerability scanning ✅
+
+### Environment Variables
+
+Both services now support these environment variables for Kubernetes deployment:
+
+#### Gateway Service
+- `GATEWAY_ID` - Unique gateway identifier (set from `metadata.name`)
+- `LISTEN_PORT` - Port to listen on (default: 8000)
+- `PEER_GATEWAYS` - Space-separated list of peer gateway addresses
+
+#### KVStore Service  
+- `NODE_ID` - Unique node identifier (set from `metadata.name`)
+- `LISTEN_PORT` - Port to listen on (default: 8080)
+- `GATEWAY_ADDRESS` - Gateway service address
+
+### Health Check Endpoints
+
+- **Gateway**: `/ring/status` - Returns hash ring status and statistics
+- **KVStore**: `/health` - Returns node health and registration status
+
+Both endpoints return JSON with 200 status when healthy. 

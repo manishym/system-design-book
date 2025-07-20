@@ -16,7 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy gateway service code (simplified version)
-COPY gateway/gateway_service_simple.py gateway_service.py
+COPY gateway/gateway_service_simple.py gateway_service_simple.py
 COPY gateway/simple_hash_ring.py simple_hash_ring.py
 
 # Expose ports
@@ -33,7 +33,4 @@ ENV LISTEN_PORT=8000
 ENV PEER_GATEWAYS=""
 
 # Run the gateway service (simplified version)
-CMD python gateway_service.py \
-    --gateway-id ${GATEWAY_ID} \
-    --port ${LISTEN_PORT} \
-    --peers ${PEER_GATEWAYS} 
+CMD python gateway_service_simple.py 

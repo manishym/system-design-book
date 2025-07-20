@@ -32,7 +32,4 @@ ENV LISTEN_PORT=8080
 ENV GATEWAY_ADDRESS=""
 
 # Run the kvstore service
-CMD python kvstore_service.py \
-    --node-id ${NODE_ID} \
-    --port ${LISTEN_PORT} \
-    --gateway ${GATEWAY_ADDRESS} 
+CMD python kvstore_service.py 
