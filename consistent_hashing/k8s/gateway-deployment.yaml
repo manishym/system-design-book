@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gateway
+  namespace: consistent-hashing
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: consistent-hashing
+spec:
+  serviceName: gateway-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+        app.kubernetes.io/component: gateway
+    spec:
+      containers:
+      - name: gateway
+        image: consistent-hashing/gateway:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: GATEWAY_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: LISTEN_PORT
+          value: "8000"
+        - name: PEER_GATEWAYS
+          value: "gateway-0.gateway-headless.consistent-hashing.svc.cluster.local:8000 gateway-1.gateway-headless.consistent-hashing.svc.cluster.local:8000 gateway-2.gateway-headless.consistent-hashing.svc.cluster.local:8000"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /ring/status
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ring/status
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        # No persistent volumes needed for simplified version
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-headless
+  namespace: consistent-hashing
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: gateway
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-service
+  namespace: consistent-hashing
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP 

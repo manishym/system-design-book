@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: consistent-hashing
+  labels:
+    app.kubernetes.io/name: consistent-hashing
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: system 

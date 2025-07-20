@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: consistent-hashing
+  
+namespace: consistent-hashing
+
+resources:
+  - namespace.yaml
+  - gateway-deployment.yaml
+  - kvstore-deployment.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: consistent-hashing
+  app.kubernetes.io/managed-by: kustomize
+
+images:
+  - name: consistent-hashing/gateway
+    newTag: latest
+  - name: consistent-hashing/kvstore
+    newTag: latest 
