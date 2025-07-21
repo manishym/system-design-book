@@ -3,6 +3,7 @@ name: Unit and Integration Tests
 on:
   pull_request:
     paths:
+      branches: [ main ]
       - 'rate_limiter/**'     # Only trigger if files in rate_limiter folder change
       - '.github/workflows/unit-tests.yaml'  # Also trigger if this workflow changes
   push:

@@ -1,0 +1,504 @@
+name: Consistent Hashing System Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'consistent_hashing/**'
+      - '.github/workflows/consistent-hashing-test.yml'
+  pull_request:
+    paths:
+      - 'consistent_hashing/**'
+      - '.github/workflows/consistent-hashing-test.yml'
+  workflow_dispatch:
+
+env:
+  KIND_VERSION: v0.20.0
+  KUBECTL_VERSION: v1.28.0
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('consistent_hashing/requirements.txt', 'consistent_hashing/tests/requirements-test.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        working-directory: consistent_hashing
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r tests/requirements-test.txt
+
+      - name: Run unit tests
+        working-directory: consistent_hashing
+        env:
+          PYTHONPATH: ${{ github.workspace }}/consistent_hashing
+        run: |
+          python -m pytest tests/unit/ -v \
+            --cov=gateway \
+            --cov=storage \
+            --cov-report=xml \
+            --cov-report=html \
+            --junit-xml=test-results-unit.xml
+
+      - name: Upload unit test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: |
+            consistent_hashing/test-results-unit.xml
+            consistent_hashing/htmlcov/
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        if: always()
+        with:
+          file: consistent_hashing/coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+
+  integration-tests:
+    name: Integration Tests in Kind
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    strategy:
+      matrix:
+        kind-node-image: 
+          - kindest/node:v1.28.0
+          - kindest/node:v1.27.3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Create Kind cluster
+        run: |
+          cat <<EOF | kind create cluster --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          name: consistent-hashing-test
+          nodes:
+          - role: control-plane
+            image: ${{ matrix.kind-node-image }}
+            kubeadmConfigPatches:
+            - |
+              kind: InitConfiguration
+              nodeRegistration:
+                kubeletExtraArgs:
+                  node-labels: "ingress-ready=true"
+            extraPortMappings:
+            - containerPort: 30000
+              hostPort: 30000
+              protocol: TCP
+            - containerPort: 32000
+              hostPort: 32000
+              protocol: TCP
+          - role: worker
+            image: ${{ matrix.kind-node-image }}
+          - role: worker
+            image: ${{ matrix.kind-node-image }}
+          EOF
+
+      - name: Wait for cluster to be ready
+        run: |
+          kubectl cluster-info --context kind-consistent-hashing-test
+          kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+      - name: Install Python dependencies
+        working-directory: consistent_hashing
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r tests/requirements-test.txt
+
+      - name: Build Docker images
+        working-directory: consistent_hashing
+        run: |
+          # Build gateway image
+          docker build -f gateway/Dockerfile -t consistent-hashing/gateway:test .
+          
+          # Build kvstore image
+          docker build -f storage/kvstore/Dockerfile -t consistent-hashing/kvstore:test .
+          
+          # Load images into Kind cluster
+          kind load docker-image consistent-hashing/gateway:test --name consistent-hashing-test
+          kind load docker-image consistent-hashing/kvstore:test --name consistent-hashing-test
+
+      - name: Deploy local container registry
+        working-directory: consistent_hashing
+        run: |
+          # Create registry namespace and deployment
+          kubectl create namespace container-registry || true
+          
+          # Deploy local registry
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: registry
+            namespace: container-registry
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: registry
+            template:
+              metadata:
+                labels:
+                  app: registry
+              spec:
+                containers:
+                - name: registry
+                  image: registry:2.8.3
+                  ports:
+                  - containerPort: 5000
+                  env:
+                  - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+                    value: /var/lib/registry
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: registry
+            namespace: container-registry
+          spec:
+            type: NodePort
+            selector:
+              app: registry
+            ports:
+            - port: 5000
+              targetPort: 5000
+              nodePort: 32000
+          EOF
+          
+          # Wait for registry to be ready
+          kubectl wait --for=condition=available deployment/registry -n container-registry --timeout=300s
+
+      - name: Deploy consistent hashing system
+        working-directory: consistent_hashing
+        run: |
+          # Create namespace
+          kubectl create namespace consistent-hashing || true
+          
+          # Apply namespace first
+          kubectl apply -f k8s/namespace.yaml || true
+          
+          # Update and apply gateway deployment
+          sed 's|image: consistent-hashing/gateway:latest|image: consistent-hashing/gateway:test|g' k8s/gateway-deployment.yaml | \
+          sed 's|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|g' | \
+          kubectl apply -f -
+          
+          # Update and apply kvstore deployment  
+          sed 's|image: consistent-hashing/kvstore:latest|image: consistent-hashing/kvstore:test|g' k8s/kvstore-deployment.yaml | \
+          sed 's|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|g' | \
+          kubectl apply -f -
+
+      - name: Wait for services to be ready
+        run: |
+          # Check initial pod status
+          kubectl get pods -n consistent-hashing -o wide
+          
+          # Wait for gateway pods with better error handling
+          echo "Waiting for gateway pods..."
+          if ! kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=gateway -n consistent-hashing --timeout=600s; then
+            echo "Gateway pods failed to become ready. Investigating..."
+            kubectl get pods -n consistent-hashing
+            kubectl describe pods -l app.kubernetes.io/name=gateway -n consistent-hashing
+            kubectl logs -l app.kubernetes.io/name=gateway -n consistent-hashing --tail=100 || true
+            exit 1
+          fi
+          
+          # Wait for kvstore pods
+          echo "Waiting for kvstore pods..."
+          if ! kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=kvstore -n consistent-hashing --timeout=600s; then
+            echo "KVStore pods failed to become ready. Investigating..."
+            kubectl get pods -n consistent-hashing
+            kubectl describe pods -l app.kubernetes.io/name=kvstore -n consistent-hashing
+            kubectl logs -l app.kubernetes.io/name=kvstore -n consistent-hashing --tail=100 || true
+            exit 1
+          fi
+          
+          # Check final pod status
+          kubectl get pods -n consistent-hashing -o wide
+
+      - name: Set up port forwarding for tests
+        run: |
+          # Port forward gateway service
+          kubectl port-forward svc/gateway-service 8000:8000 -n consistent-hashing &
+          GATEWAY_PF_PID=$!
+          echo "GATEWAY_PF_PID=$GATEWAY_PF_PID" >> $GITHUB_ENV
+          
+          # Port forward kvstore service
+          kubectl port-forward svc/kvstore-service 8080:8080 -n consistent-hashing &
+          KVSTORE_PF_PID=$!
+          echo "KVSTORE_PF_PID=$KVSTORE_PF_PID" >> $GITHUB_ENV
+          
+          # Wait for port forwards to be ready
+          sleep 10
+          
+          # Test connectivity
+          curl -f http://localhost:8000/nodes || (echo "Gateway not accessible" && exit 1)
+
+      - name: Run integration tests
+        working-directory: consistent_hashing
+        env:
+          PYTHONPATH: ${{ github.workspace }}/consistent_hashing
+        run: |
+          # Test system health
+          python run_tests.py --check-system
+          
+          # Run integration tests
+          python -m pytest tests/e2e/ -v \
+            --junit-xml=test-results-integration.xml \
+            -m "e2e" \
+            --timeout=300
+
+      - name: Run system validation tests
+        working-directory: consistent_hashing
+        env:
+          PYTHONPATH: ${{ github.workspace }}/consistent_hashing
+        run: |
+          python -m tests.system_validation --basic-ops
+
+      - name: Run load tests
+        working-directory: consistent_hashing
+        env:
+          PYTHONPATH: ${{ github.workspace }}/consistent_hashing
+        run: |
+          python -m tests.system_validation --load-test
+
+      - name: Collect system information
+        if: always()
+        run: |
+          echo "=== Cluster Information ==="
+          kubectl get nodes -o wide
+          
+          echo "=== Pod Status ==="
+          kubectl get pods -A -o wide
+          
+          echo "=== Service Status ==="
+          kubectl get svc -A
+          
+          echo "=== Gateway Logs ==="
+          kubectl logs -l app.kubernetes.io/name=gateway -n consistent-hashing --tail=50 || true
+          
+          echo "=== KVStore Logs ==="
+          kubectl logs -l app.kubernetes.io/name=kvstore -n consistent-hashing --tail=50 || true
+
+      - name: Set artifact name
+        run: |
+          SANITIZED_NAME=$(echo "${{ matrix.kind-node-image }}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          echo "ARTIFACT_NAME=integration-test-results-${SANITIZED_NAME}" >> $GITHUB_ENV
+
+      - name: Upload integration test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            consistent_hashing/test-results-integration.xml
+
+      - name: Cleanup port forwards
+        if: always()
+        run: |
+          if [ ! -z "$GATEWAY_PF_PID" ]; then
+            kill $GATEWAY_PF_PID || true
+          fi
+          if [ ! -z "$KVSTORE_PF_PID" ]; then
+            kill $KVSTORE_PF_PID || true
+          fi
+
+      - name: Cleanup Kind cluster
+        if: always()
+        run: |
+          kind delete cluster --name consistent-hashing-test || true
+
+  chaos-tests:
+    name: Chaos Engineering Tests
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Create Kind cluster for chaos testing
+        run: |
+          cat <<EOF | kind create cluster --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          name: chaos-test
+          nodes:
+          - role: control-plane
+          - role: worker
+          - role: worker
+          - role: worker
+          EOF
+
+      - name: Install Python dependencies
+        working-directory: consistent_hashing
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r tests/requirements-test.txt
+
+      - name: Build and deploy system for chaos testing
+        working-directory: consistent_hashing
+        run: |
+          # Build images
+          docker build -f gateway/Dockerfile -t consistent-hashing/gateway:chaos .
+          docker build -f storage/kvstore/Dockerfile -t consistent-hashing/kvstore:chaos .
+          
+          # Load into Kind
+          kind load docker-image consistent-hashing/gateway:chaos --name chaos-test
+          kind load docker-image consistent-hashing/kvstore:chaos --name chaos-test
+          
+          # Deploy system
+          kubectl create namespace consistent-hashing
+          
+          # Apply namespace
+          kubectl apply -f k8s/namespace.yaml || true
+          
+          # Deploy with chaos images
+          sed 's|consistent-hashing/gateway:latest|consistent-hashing/gateway:chaos|g' k8s/gateway-deployment.yaml | \
+          sed 's|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|g' | \
+          kubectl apply -f -
+          
+          sed 's|consistent-hashing/kvstore:latest|consistent-hashing/kvstore:chaos|g' k8s/kvstore-deployment.yaml | \
+          sed 's|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|g' | \
+          sed 's|replicas: 3|replicas: 6|g' | \
+          kubectl apply -f -
+          
+          # Wait for deployment
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=gateway -n consistent-hashing --timeout=300s
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=kvstore -n consistent-hashing --timeout=300s
+
+      - name: Run chaos engineering tests
+        working-directory: consistent_hashing
+        env:
+          PYTHONPATH: ${{ github.workspace }}/consistent_hashing
+        run: |
+          # Set up port forwarding
+          kubectl port-forward svc/gateway-service 8000:8000 -n consistent-hashing &
+          sleep 10
+          
+          # Run chaos tests (limited set for CI)
+          python -m pytest tests/chaos/ -v \
+            --junit-xml=test-results-chaos.xml \
+            -m "chaos" \
+            --timeout=600 \
+            -k "not memory_pressure and not high_connection_load"
+
+      - name: Upload chaos test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos-test-results
+          path: consistent_hashing/test-results-chaos.xml
+
+      - name: Cleanup chaos cluster
+        if: always()
+        run: |
+          kind delete cluster --name chaos-test || true
+
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: './consistent_hashing'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  build-validation:
+    name: Build Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build gateway image
+        working-directory: consistent_hashing
+        run: |
+          docker build -f gateway/Dockerfile -t consistent-hashing/gateway:build-test .
+
+      - name: Build kvstore image
+        working-directory: consistent_hashing
+        run: |
+          docker build -f storage/kvstore/Dockerfile -t consistent-hashing/kvstore:build-test .
+
+      - name: Test image functionality
+        run: |
+          # Test gateway image
+          docker run --rm consistent-hashing/gateway:build-test python -c "from simple_hash_ring import SimpleHashRing; print('Gateway image OK')"
+          
+          # Test kvstore image
+          docker run --rm consistent-hashing/kvstore:build-test python -c "import kvstore_service; print('KVStore image OK')" 

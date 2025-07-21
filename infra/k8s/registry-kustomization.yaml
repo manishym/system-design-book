@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: container-registry
+
+namespace: container-registry
+
+resources:
+  - registry-namespace.yaml
+  - registry-storage.yaml
+  - registry-deployment.yaml
+  - registry-nodeport.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: container-registry
+  app.kubernetes.io/managed-by: kustomize 
